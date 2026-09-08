@@ -29,6 +29,20 @@ const Header = struct {
     crc: u16,
 };
 
+const MessageType = enum(u1) {
+    data_message = 0,
+    definition_message = 1,
+};
+
+// See Table 2 of https://developer.garmin.com/fit/protocol/
+const RecordHeader = packed struct(u8) {
+    local_message_type: u4,
+    reserved: u1,
+    message_type_specific: u1,
+    message_type: MessageType,
+    normal_header: u1,
+};
+
 pub const FitError = error{
     InvalidMagic,
 };
@@ -69,6 +83,12 @@ const Parser = struct {
             .crc = crc,
         };
     }
+
+    fn parseRecordHeader(self: *Parser) !void {
+        const raw = try self.in.takeByte();
+        const header: RecordHeader = @bitCast(raw);
+        std.debug.print("{}", .{header});
+    }
 };
 
 // https://github.com/garmin/fit-java-sdk/blob/main/src/test/java/com/garmin/fit/TestData.java
@@ -94,4 +114,6 @@ test "init" {
         .data_type = .{ '.', 'F', 'I', 'T' },
         .crc = 41870,
     }, parser.header);
+
+    try parser.parseRecordHeader();
 }
