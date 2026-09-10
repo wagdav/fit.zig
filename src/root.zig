@@ -1,26 +1,14 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
 const assert = std.debug.assert;
+const Endian = std.builtin.Endian;
 const Io = std.Io;
 const Reader = std.Io.Reader;
 const testing = std.testing;
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
-
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
-}
-
-const Header = struct {
+/// Information about the FIT File
+/// See Table 1 of https://developer.garmin.com/fit/protocol/
+const FileHeader = struct {
     size: u8,
     protocol_version: u8,
     profile_version: u16,
@@ -29,33 +17,98 @@ const Header = struct {
     crc: u16,
 };
 
-const MessageType = enum(u1) {
-    data_message = 0,
-    definition_message = 1,
-};
+/// The record header indicates whether the record content contains a
+/// definition message, a normal data message or a compressed timestamp data
+/// message. The record header also has a Local Message Type field that
+/// references the local message in the data record to its global FIT message.
+const RecordHeader = union(enum) {
+    normal: Normal,
+    compressed_timestamp: CompressedTimestamp,
 
-// See Table 2 of https://developer.garmin.com/fit/protocol/
-const RecordHeader = packed struct(u8) {
-    local_message_type: u4,
-    reserved: u1,
-    message_type_specific: u1,
-    message_type: MessageType,
-    normal_header: u1,
+    // See Table 2 of https://developer.garmin.com/fit/protocol/
+    const Normal = packed struct(u8) {
+        local_message_type: u4, // bits 0..3
+        reserved: u1, // bit 4
+        has_developer_data: bool, // bit 5
+        is_definition: bool, // bit 6
+        header_type: Type, // bit 7
+    };
+
+    // See Table 3 of https://developer.garmin.com/fit/protocol/
+    const CompressedTimestamp = packed struct(u8) {
+        time_offset: u5,
+        local_message_type: u2,
+        header_type: Type,
+    };
+
+    const Type = enum(u1) {
+        normal = 0,
+        compressed_timestamp = 1,
+    };
+
+    fn decode(raw: u8) RecordHeader {
+        if (raw & 0b1000_0000 == 0) {
+            const h: Normal = @bitCast(raw);
+            assert(h.header_type == .normal);
+            return .{ .normal = h };
+        } else {
+            const h: CompressedTimestamp = @bitCast(raw);
+            assert(h.header_type == .compressed_timestamp);
+            return .{ .compressed_timestamp = h };
+        }
+    }
 };
 
 pub const FitError = error{
     InvalidMagic,
+    InvalidArchitecture,
 };
 
-const Parser = struct {
+const max_definitions = 16;
+const max_fields = 256;
+const DefinitionMessage = struct {
+    arch: u8,
+    global_message_number: u16,
+    num_fields: u8,
+    fields: [max_fields]FieldDefinition,
+};
+
+// See Table 5 of https://developer.garmin.com/fit/protocol/
+const FieldDefinition = struct {
+    field_definition_number: u8,
+    size: u8,
+    base_type: u16,
+};
+
+fn endian(arch: u8) !Endian {
+    return switch (arch) {
+        0 => .little,
+        1 => .big,
+        else => FitError.InvalidArchitecture,
+    };
+}
+
+pub const Parser = struct {
     in: *Reader,
-    header: Header,
+    header: FileHeader,
+    definitions: [max_definitions]DefinitionMessage = undefined,
 
     pub fn init(in: *Reader) Parser {
         return .{
             .in = in,
             .header = undefined,
         };
+    }
+
+    pub fn parseFile(self: *Parser) !void {
+        try self.parseHeader();
+        std.debug.print("FileHeader: {}\n", .{self.header});
+        const data_start = self.in.seek;
+        while (self.in.seek < data_start + self.header.data_size) {
+            try self.parseRecord();
+        }
+        const crc = try self.in.takeInt(u16, .little);
+        _ = crc; // TODO Read CRC
     }
 
     fn parseHeader(self: *Parser) !void {
@@ -84,10 +137,66 @@ const Parser = struct {
         };
     }
 
-    fn parseRecordHeader(self: *Parser) !void {
-        const raw = try self.in.takeByte();
-        const header: RecordHeader = @bitCast(raw);
-        std.debug.print("{}", .{header});
+    fn parseRecord(self: *Parser) !void {
+        const header: RecordHeader = .decode(try self.in.takeByte());
+        std.debug.print("{}\n", .{header});
+
+        // Decode Record Content
+        switch (header) {
+            .normal => |h| { // Normal Header
+                if (h.is_definition) {
+                    // No support for extended definition for developer data
+                    assert(!h.has_developer_data);
+
+                    self.in.toss(1); // skip reserved field
+                    const arch = try self.in.takeByte();
+                    const global_message_number = try self.in.takeInt(u16, try endian(arch));
+                    const num_fields = try self.in.takeByte();
+
+                    var definition: DefinitionMessage = .{
+                        .arch = arch,
+                        .global_message_number = global_message_number,
+                        .num_fields = num_fields,
+                        .fields = undefined,
+                    };
+
+                    for (0..definition.num_fields) |i| {
+                        const field_definition_number = try self.in.takeByte();
+                        const size = try self.in.takeByte();
+                        const base_type = try self.in.takeByte(); // TODO: Decode accordng to Table 6.
+
+                        const field: FieldDefinition = .{
+                            .field_definition_number = field_definition_number,
+                            .size = size,
+                            .base_type = base_type,
+                        };
+
+                        definition.fields[i] = field;
+                    }
+
+                    // Save the message definition
+                    std.debug.print("Saving {}\n", .{h.local_message_type});
+                    self.definitions[h.local_message_type] = definition;
+                } else { // Data Message
+                    // Reserved in data messages and should be set to zero (false)
+                    assert(!h.has_developer_data);
+
+                    // Look up the local message type
+                    const definition = self.definitions[h.local_message_type];
+
+                    // Run through all data fields
+                    std.debug.print("Data: {}\n", .{definition.global_message_number});
+                    for (0..definition.num_fields) |i| {
+                        const field = definition.fields[i];
+                        _ = try self.in.take(field.size);
+                    }
+                }
+            },
+            .compressed_timestamp => |h| {
+                _ = h;
+                unreachable; // Cannot read compressed timestamps yet
+            },
+        }
     }
 };
 
@@ -99,14 +208,14 @@ const fit_file_short = [_]u8{
     0x5D, 0xF2, // CRC
 };
 
-test "init" {
+test "parse header" {
     var r: Reader = .fixed(&fit_file_short);
     var parser: Parser = .init(&r);
 
     try parser.parseHeader();
 
     // If I make a mistake here, the compiler doesn't point to the incorrect field.
-    try testing.expectEqual(Header{
+    try testing.expectEqual(FileHeader{
         .size = 14,
         .protocol_version = 32,
         .profile_version = 2187,
@@ -115,5 +224,11 @@ test "init" {
         .crc = 41870,
     }, parser.header);
 
-    try parser.parseRecordHeader();
+    try parser.parseRecord();
+}
+
+test "parse minimal" {
+    var r: Reader = .fixed(&fit_file_short);
+    var parser: Parser = .init(&r);
+    try parser.parseFile();
 }
