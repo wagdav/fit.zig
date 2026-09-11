@@ -155,37 +155,7 @@ pub const Parser = struct {
                     // No support for extended definition for developer data
                     assert(!h.has_developer_data);
 
-                    _ = try self.in.take(1); // skip reserved field
-                    const arch = try self.in.takeByte();
-                    const global_message_number = try self.in.takeInt(u16, try endian(arch));
-                    const num_fields = try self.in.takeByte();
-                    self.data_read += 5;
-
-                    var definition: DefinitionMessage = .{
-                        .arch = arch,
-                        .global_message_number = global_message_number,
-                        .num_fields = num_fields,
-                        .fields = undefined,
-                    };
-
-                    for (0..definition.num_fields) |i| {
-                        const field_definition_number = try self.in.takeByte();
-                        const size = try self.in.takeByte();
-                        const base_type = try self.in.takeByte(); // TODO: Decode accordng to Table 6.
-                        self.data_read += 3;
-
-                        const field: FieldDefinition = .{
-                            .field_definition_number = field_definition_number,
-                            .size = size,
-                            .base_type = base_type,
-                        };
-
-                        definition.fields[i] = field;
-                    }
-
-                    // Save the message definition
-                    std.debug.print("Saving {}\n", .{h.local_message_type});
-                    self.definitions[h.local_message_type] = definition;
+                    try self.parseDefinitionMessage(h);
                 } else { // Data Message
                     // Reserved in data messages and should be set to zero (false)
                     assert(!h.has_developer_data);
@@ -208,6 +178,40 @@ pub const Parser = struct {
                 unreachable; // Cannot read compressed timestamps yet
             },
         }
+    }
+
+    fn parseDefinitionMessage(self: *Parser, header: RecordHeader.Normal) !void {
+        _ = try self.in.take(1); // skip reserved field
+        const arch = try self.in.takeByte();
+        const global_message_number = try self.in.takeInt(u16, try endian(arch));
+        const num_fields = try self.in.takeByte();
+        self.data_read += 5;
+
+        var definition: DefinitionMessage = .{
+            .arch = arch,
+            .global_message_number = global_message_number,
+            .num_fields = num_fields,
+            .fields = undefined,
+        };
+
+        for (0..definition.num_fields) |i| {
+            const field_definition_number = try self.in.takeByte();
+            const size = try self.in.takeByte();
+            const base_type = try self.in.takeByte(); // TODO: Decode accordng to Table 6.
+            self.data_read += 3;
+
+            const field: FieldDefinition = .{
+                .field_definition_number = field_definition_number,
+                .size = size,
+                .base_type = base_type,
+            };
+
+            definition.fields[i] = field;
+        }
+
+        // Save the message definition
+        std.debug.print("Saving {}\n", .{header.local_message_type});
+        self.definitions[header.local_message_type] = definition;
     }
 };
 
