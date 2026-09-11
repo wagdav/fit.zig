@@ -65,7 +65,7 @@ pub const FitError = error{
 };
 
 const max_definitions = 16;
-const max_fields = 128;
+const max_fields = 256;
 const DefinitionMessage = struct {
     arch: u8,
     global_message_number: u16,
@@ -224,8 +224,7 @@ test "parse header" {
 
     try parser.parseHeader();
 
-    // If I make a mistake here, the compiler doesn't point to the incorrect field.
-    try testing.expectEqual(FileHeader{
+    try testing.expectEqualDeep(FileHeader{
         .size = 14,
         .protocol_version = 32,
         .profile_version = 2187,
