@@ -91,7 +91,7 @@ fn endian(arch: u8) !Endian {
 pub const Parser = struct {
     in: *Reader,
     header: FileHeader,
-    definitions: [max_definitions]DefinitionMessage = undefined,
+    definitions: [max_definitions]DefinitionMessage,
     data_read: u32,
     data_message_index: u32,
 
@@ -101,6 +101,7 @@ pub const Parser = struct {
             .data_message_index = 1,
             .in = in,
             .header = undefined,
+            .definitions = undefined,
         };
     }
 
