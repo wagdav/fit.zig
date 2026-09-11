@@ -65,7 +65,7 @@ pub const FitError = error{
 };
 
 const max_definitions = 16;
-const max_fields = 256;
+const max_fields = 128;
 const DefinitionMessage = struct {
     arch: u8,
     global_message_number: u16,
@@ -77,7 +77,7 @@ const DefinitionMessage = struct {
 const FieldDefinition = struct {
     field_definition_number: u8,
     size: u8,
-    base_type: u16,
+    base_type: u8,
 };
 
 fn endian(arch: u8) !Endian {
@@ -92,9 +92,13 @@ pub const Parser = struct {
     in: *Reader,
     header: FileHeader,
     definitions: [max_definitions]DefinitionMessage = undefined,
+    data_read: u32,
+    data_message_index: u32,
 
     pub fn init(in: *Reader) Parser {
         return .{
+            .data_read = 0,
+            .data_message_index = 1,
             .in = in,
             .header = undefined,
         };
@@ -103,8 +107,9 @@ pub const Parser = struct {
     pub fn parseFile(self: *Parser) !void {
         try self.parseHeader();
         std.debug.print("FileHeader: {}\n", .{self.header});
-        const data_start = self.in.seek;
-        while (self.in.seek < data_start + self.header.data_size) {
+
+        self.data_read = 0;
+        while (self.data_read < self.header.data_size) {
             try self.parseRecord();
         }
         const crc = try self.in.takeInt(u16, .little);
@@ -118,14 +123,14 @@ pub const Parser = struct {
         const data_size = try self.in.takeInt(u32, .little);
         const data_type = try self.in.takeArray(4);
         if (!std.mem.eql(u8, data_type, ".FIT")) return FitError.InvalidMagic;
-        assert(self.in.seek == 12);
 
         // Decode CRC
         const crc = if (size > 12) try self.in.takeInt(u16, .little) else 0;
-        assert(self.in.seek == 14);
 
         // Ignore the rest of the header
-        if (size > 14) self.in.toss(size - 14);
+        if (size > 14) {
+            _ = try self.in.take(size - 14);
+        }
 
         self.header = .{
             .size = size,
@@ -139,6 +144,7 @@ pub const Parser = struct {
 
     fn parseRecord(self: *Parser) !void {
         const header: RecordHeader = .decode(try self.in.takeByte());
+        self.data_read += 1;
         std.debug.print("{}\n", .{header});
 
         // Decode Record Content
@@ -148,10 +154,11 @@ pub const Parser = struct {
                     // No support for extended definition for developer data
                     assert(!h.has_developer_data);
 
-                    self.in.toss(1); // skip reserved field
+                    _ = try self.in.take(1); // skip reserved field
                     const arch = try self.in.takeByte();
                     const global_message_number = try self.in.takeInt(u16, try endian(arch));
                     const num_fields = try self.in.takeByte();
+                    self.data_read += 5;
 
                     var definition: DefinitionMessage = .{
                         .arch = arch,
@@ -164,6 +171,7 @@ pub const Parser = struct {
                         const field_definition_number = try self.in.takeByte();
                         const size = try self.in.takeByte();
                         const base_type = try self.in.takeByte(); // TODO: Decode accordng to Table 6.
+                        self.data_read += 3;
 
                         const field: FieldDefinition = .{
                             .field_definition_number = field_definition_number,
@@ -185,10 +193,12 @@ pub const Parser = struct {
                     const definition = self.definitions[h.local_message_type];
 
                     // Run through all data fields
-                    std.debug.print("Data: {}\n", .{definition.global_message_number});
+                    std.debug.print("Data: {} {}\n", .{ self.data_message_index, definition.global_message_number });
+                    self.data_message_index += 1;
                     for (0..definition.num_fields) |i| {
                         const field = definition.fields[i];
                         _ = try self.in.take(field.size);
+                        self.data_read += field.size;
                     }
                 }
             },
