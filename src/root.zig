@@ -25,7 +25,7 @@ const RecordHeader = union(enum) {
     normal: Normal,
     compressed_timestamp: CompressedTimestamp,
 
-    // See Table 2 of https://developer.garmin.com/fit/protocol/
+    /// See Table 2 of https://developer.garmin.com/fit/protocol/
     const Normal = packed struct(u8) {
         local_message_type: u4, // bits 0..3
         reserved: u1, // bit 4
@@ -34,7 +34,7 @@ const RecordHeader = union(enum) {
         header_type: Type, // bit 7
     };
 
-    // See Table 3 of https://developer.garmin.com/fit/protocol/
+    /// See Table 3 of https://developer.garmin.com/fit/protocol/
     const CompressedTimestamp = packed struct(u8) {
         time_offset: u5,
         local_message_type: u2,
@@ -65,8 +65,9 @@ pub const FitError = error{
     InvalidMagic,
 };
 
-const max_definitions = 16;
 const max_fields = 256;
+
+/// See Table 4 of https://developer.garmin.com/fit/protocol/
 const DefinitionMessage = struct {
     arch: u8,
     global_message_number: u16,
@@ -74,7 +75,7 @@ const DefinitionMessage = struct {
     fields: [max_fields]FieldDefinition,
 };
 
-// See Table 5 of https://developer.garmin.com/fit/protocol/
+/// See Table 5 of https://developer.garmin.com/fit/protocol/
 const FieldDefinition = struct {
     field_definition_number: u8,
     size: u8,
@@ -109,15 +110,37 @@ const BaseType = enum(u8) {
     uint64 = 0x8F,
     uint64z = 0x90,
 
+    fn decode(raw: u8) !BaseType {
+        return std.enums.fromInt(BaseType, raw) orelse FitError.InvalidBaseType;
+    }
+
+    /// Bytes per element.
     fn size(self: BaseType) u8 {
         return switch (self) {
-            .enum_, .sint, .uint8, .string, .uint8z, .byte => 1,
+            .enum_, .sint8, .uint8, .string, .uint8z, .byte => 1,
             .sint16, .uint16, .uint16z => 2,
             .sint32, .uint32, .float32, .uint32z => 4,
             .float64, .sint64, .uint64, .uint64z => 8,
         };
     }
+
+    /// The value that indicates the field is not set.
+    fn invalid(self: BaseType) u64 {
+        return switch (self) {
+            .sint8 => 0x7F,
+            .enum_, .uint8, .byte => 0xFF,
+            .string, .uint8z, .uint16z, .uint32z, .uint64z => 0x00,
+            .sint16 => 0x7FFF,
+            .uint16 => 0xFFFF,
+            .sint32 => 0x7FFFFFFF,
+            .uint32, .float32 => 0xFFFFFFFF,
+            .sint64 => 0x7FFFFFFFFFFFFFFF,
+            .uint64, .float64 => 0xFFFFFFFFFFFFFFFF,
+        };
+    }
 };
+
+const max_definitions = 16;
 
 pub const Parser = struct {
     in: *Reader,
@@ -235,113 +258,84 @@ pub const Parser = struct {
         // Look up the local message type
         const definition = self.definitions[header.local_message_type];
 
-        // Run through all data fields
+        // Print the data message type
         std.debug.print("{}. unknown_{}\n", .{ self.data_message_index, definition.global_message_number });
         self.data_message_index += 1;
+
+        const en = try endian(definition.arch);
+
+        // Run through all data fields
         for (0..definition.num_fields) |i| {
             const field = definition.fields[i];
+            const invalid = field.base_type.invalid();
 
-            std.debug.print(" * unknown_{}: {s} ", .{ field.field_definition_number, field.base_type.name });
+            std.debug.print(" * unknown_{}: ", .{field.field_definition_number});
 
-            const elements = @divExact(field.size, field.base_type.size);
-            for (0..elements) |j| {
-                _ = j;
-                switch (field.base_type.number) {
-                    0 => { // enum
-                        const value = try self.in.takeByte();
-                        if (value == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    1 => { // sint8
-                        const value = try self.in.takeInt(i8, .little);
-                        if (value == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    2 => { // uint8
-                        const value = try self.in.takeByte();
-                        if (value == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    3 => { // sint16
-                        const value = try self.in.takeInt(i16, try endian(definition.arch));
-                        if (value == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    4 => { // uint16
-                        const value = try self.in.takeInt(u16, try endian(definition.arch));
-                        if (value == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    5 => { // sint32
-                        const value = try self.in.takeInt(i32, try endian(definition.arch));
-                        if (value == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    6 => { // uint32
-                        const value = try self.in.takeInt(u32, try endian(definition.arch));
-                        if (value == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    7 => { // string
-                        const value = try self.in.takeByte();
-                        if (value == field.base_type.invalid) {
-                            std.debug.print("", .{});
-                        } else {
-                            std.debug.print("{c}", .{value});
-                        }
-                        // FIX: null terminated string
-                    },
-                    8 => { // float32
-                        const value_int = try self.in.takeInt(u32, try endian(definition.arch));
-                        if (value_int == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            const value: f32 = @bitCast(value_int);
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    9 => { // float64
-                        const value_int = try self.in.takeInt(u64, try endian(definition.arch));
-                        if (value_int == field.base_type.invalid) {
-                            std.debug.print("None", .{});
-                        } else {
-                            const value: f64 = @bitCast(value_int);
-                            std.debug.print("{}", .{value});
-                        }
-                    },
-                    // TODO add the rest of the variants
-                    else => {
-                        _ = try self.in.take(field.base_type.size);
-                    },
+            const elements = @divExact(field.size, field.base_type.size());
+            const is_array = elements > 1;
+
+            // special case for strings
+            if (field.base_type == .string) {
+                const bytes = try self.in.take(field.size);
+                const s = std.mem.sliceTo(bytes, 0);
+                std.debug.print("{s}", .{s});
+            } else {
+                if (is_array) std.debug.print("(", .{}); // opening paren
+
+                for (0..elements) |j| {
+                    switch (field.base_type) {
+                        .enum_ => printOptional(try self.takeField(u8, en, invalid)),
+                        .sint8 => printOptional(try self.takeField(i8, en, invalid)),
+                        .uint8 => printOptional(try self.takeField(u8, en, invalid)),
+                        .sint16 => printOptional(try self.takeField(i16, en, invalid)),
+                        .uint16 => printOptional(try self.takeField(u16, en, invalid)),
+                        .sint32 => printOptional(try self.takeField(i32, en, invalid)),
+                        .uint32 => printOptional(try self.takeField(u32, en, invalid)),
+                        .string => {}, // already handled
+                        .float32 => printOptional(try self.takeField(f32, en, invalid)),
+                        .float64 => printOptional(try self.takeField(f64, en, invalid)),
+                        .uint8z => printOptional(try self.takeField(u8, en, invalid)),
+                        .uint16z => printOptional(try self.takeField(u16, en, invalid)),
+                        .uint32z => printOptional(try self.takeField(u32, en, invalid)),
+                        .byte => printOptional(try self.takeField(u8, en, invalid)),
+                        .sint64 => printOptional(try self.takeField(i64, en, invalid)),
+                        .uint64 => printOptional(try self.takeField(u64, en, invalid)),
+                        .uint64z => printOptional(try self.takeField(u64, en, invalid)),
+                    }
+                    if (is_array) {
+                        if (j < elements - 1) std.debug.print(", ", .{}); // separator
+                        if (j == elements - 1) std.debug.print(")", .{}); // closing paren
+                    }
                 }
-                std.debug.print(", ", .{});
             }
             std.debug.print("\n", .{});
             self.data_read += field.size;
         }
     }
+
+    fn takeField(self: *Parser, comptime T: type, en: Endian, invalid: u64) !?T {
+        switch (@typeInfo(T)) {
+            .int => {
+                const value = try self.in.takeInt(T, en);
+                return if (value == invalid) null else value;
+            },
+            .float => {
+                const Bits = @Int(.unsigned, @bitSizeOf(T));
+                const bits = try self.in.takeInt(Bits, en);
+                return if (bits == invalid) null else @bitCast(bits);
+            },
+            else => unreachable,
+        }
+    }
 };
+
+fn printOptional(value: anytype) void {
+    if (value) |v| {
+        std.debug.print("{d}", .{v});
+    } else {
+        std.debug.print("None", .{});
+    }
+}
 
 // https://github.com/garmin/fit-java-sdk/blob/main/src/test/java/com/garmin/fit/TestData.java
 const fit_file_short = [_]u8{
