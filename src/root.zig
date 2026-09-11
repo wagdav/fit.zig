@@ -146,31 +146,15 @@ pub const Parser = struct {
     fn parseRecord(self: *Parser) !void {
         const header: RecordHeader = .decode(try self.in.takeByte());
         self.data_read += 1;
-        std.debug.print("{}\n", .{header});
 
         // Decode Record Content
         switch (header) {
             .normal => |h| { // Normal Header
                 if (h.is_definition) {
-                    // No support for extended definition for developer data
-                    assert(!h.has_developer_data);
-
+                    assert(!h.has_developer_data); // Cannot read developer data
                     try self.parseDefinitionMessage(h);
-                } else { // Data Message
-                    // Reserved in data messages and should be set to zero (false)
-                    assert(!h.has_developer_data);
-
-                    // Look up the local message type
-                    const definition = self.definitions[h.local_message_type];
-
-                    // Run through all data fields
-                    std.debug.print("Data: {} {}\n", .{ self.data_message_index, definition.global_message_number });
-                    self.data_message_index += 1;
-                    for (0..definition.num_fields) |i| {
-                        const field = definition.fields[i];
-                        _ = try self.in.take(field.size);
-                        self.data_read += field.size;
-                    }
+                } else {
+                    try self.parseDataMessage(h);
                 }
             },
             .compressed_timestamp => |h| {
@@ -210,8 +194,26 @@ pub const Parser = struct {
         }
 
         // Save the message definition
-        std.debug.print("Saving {}\n", .{header.local_message_type});
         self.definitions[header.local_message_type] = definition;
+    }
+
+    fn parseDataMessage(self: *Parser, header: RecordHeader.Normal) !void {
+        // Reserved in data messages and should be set to zero (false)
+        assert(!header.has_developer_data);
+
+        // Look up the local message type
+        const definition = self.definitions[header.local_message_type];
+
+        // Run through all data fields
+        std.debug.print("{}. unknown_{}\n", .{ self.data_message_index, definition.global_message_number });
+        self.data_message_index += 1;
+        for (0..definition.num_fields) |i| {
+            const field = definition.fields[i];
+            _ = try self.in.take(field.size);
+            self.data_read += field.size;
+
+            std.debug.print(" * unknown_{}\n", .{field.field_definition_number});
+        }
     }
 };
 
