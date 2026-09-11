@@ -60,8 +60,9 @@ const RecordHeader = union(enum) {
 };
 
 pub const FitError = error{
-    InvalidMagic,
     InvalidArchitecture,
+    InvalidBaseType,
+    InvalidMagic,
 };
 
 const max_definitions = 16;
@@ -77,7 +78,7 @@ const DefinitionMessage = struct {
 const FieldDefinition = struct {
     field_definition_number: u8,
     size: u8,
-    base_type: u8,
+    base_type: BaseType,
 };
 
 fn endian(arch: u8) !Endian {
@@ -87,6 +88,52 @@ fn endian(arch: u8) !Endian {
         else => FitError.InvalidArchitecture,
     };
 }
+
+/// See Table 6 of https://developer.garmin.com/fit/protocol/
+const BaseType = struct {
+    /// Whether the type's multi-byte values are affected by the definition's
+    /// architecture (bit 7 of the base type field byte).
+    endian_ability: bool,
+    name: []const u8,
+    /// The value used to indicate the field is not set.
+    invalid: u64,
+    /// Bytes per element.
+    size: u8,
+
+    /// Rows indexed by base type number (bits 0..4 of the base type field byte).
+    /// See Table 7 of https://developer.garmin.com/fit/protocol/
+    const table = [_]struct { name: []const u8, invalid: u64, size: u8 }{
+        .{ .name = "enum", .invalid = 0xFF, .size = 1 }, // 0
+        .{ .name = "sint8", .invalid = 0x7F, .size = 1 }, // 1
+        .{ .name = "uint8", .invalid = 0xFF, .size = 1 }, // 2
+        .{ .name = "sint16", .invalid = 0x7FFF, .size = 2 }, // 3
+        .{ .name = "uint16", .invalid = 0xFFFF, .size = 2 }, // 4
+        .{ .name = "sint32", .invalid = 0x7FFFFFFF, .size = 4 }, // 5
+        .{ .name = "uint32", .invalid = 0xFFFFFFFF, .size = 4 }, // 6
+        .{ .name = "string", .invalid = 0x00, .size = 1 }, // 7
+        .{ .name = "float32", .invalid = 0xFFFFFFFF, .size = 4 }, // 8
+        .{ .name = "float64", .invalid = 0xFFFFFFFFFFFFFFFF, .size = 8 }, // 9
+        .{ .name = "uint8z", .invalid = 0x00, .size = 1 }, // 10
+        .{ .name = "uint16z", .invalid = 0x0000, .size = 2 }, // 11
+        .{ .name = "uint32z", .invalid = 0x00000000, .size = 4 }, // 12
+        .{ .name = "byte", .invalid = 0xFF, .size = 1 }, // 13
+        .{ .name = "sint64", .invalid = 0x7FFFFFFFFFFFFFFF, .size = 8 }, // 14
+        .{ .name = "uint64", .invalid = 0xFFFFFFFFFFFFFFFF, .size = 8 }, // 15
+        .{ .name = "uint64z", .invalid = 0x0000000000000000, .size = 8 }, // 16
+    };
+
+    fn decode(raw: u8) !BaseType {
+        const number = raw & 0x1F; // bits 0..4
+        if (number >= table.len) return FitError.InvalidBaseType;
+        const row = table[number];
+        return .{
+            .endian_ability = raw & 0x80 != 0, // bit 7
+            .name = row.name,
+            .invalid = row.invalid,
+            .size = row.size,
+        };
+    }
+};
 
 pub const Parser = struct {
     in: *Reader,
@@ -187,7 +234,7 @@ pub const Parser = struct {
             const field: FieldDefinition = .{
                 .field_definition_number = field_definition_number,
                 .size = size,
-                .base_type = base_type,
+                .base_type = try .decode(base_type),
             };
 
             definition.fields[i] = field;
@@ -212,7 +259,7 @@ pub const Parser = struct {
             _ = try self.in.take(field.size);
             self.data_read += field.size;
 
-            std.debug.print(" * unknown_{}\n", .{field.field_definition_number});
+            std.debug.print(" * unknown_{}: {s}\n", .{ field.field_definition_number, field.base_type.name });
         }
     }
 };
