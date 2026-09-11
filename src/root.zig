@@ -90,49 +90,31 @@ fn endian(arch: u8) !Endian {
 }
 
 /// See Table 6 of https://developer.garmin.com/fit/protocol/
-const BaseType = struct {
-    /// Whether the type's multi-byte values are affected by the definition's
-    /// architecture (bit 7 of the base type field byte).
-    endian_ability: bool,
-    name: []const u8,
-    /// The value used to indicate the field is not set.
-    invalid: u64,
-    /// Bytes per element.
-    size: u8,
-    number: u8,
+const BaseType = enum(u8) {
+    enum_ = 0x00,
+    sint8 = 0x01,
+    uint8 = 0x02,
+    sint16 = 0x83,
+    uint16 = 0x84,
+    sint32 = 0x85,
+    uint32 = 0x86,
+    string = 0x07,
+    float32 = 0x88,
+    float64 = 0x89,
+    uint8z = 0x0A,
+    uint16z = 0x8B,
+    uint32z = 0x8C,
+    byte = 0x0D,
+    sint64 = 0x8E,
+    uint64 = 0x8F,
+    uint64z = 0x90,
 
-    /// Rows indexed by base type number (bits 0..4 of the base type field byte).
-    /// See Table 7 of https://developer.garmin.com/fit/protocol/
-    const table = [_]struct { name: []const u8, invalid: u64, size: u8 }{
-        .{ .name = "enum", .invalid = 0xFF, .size = 1 }, // 0
-        .{ .name = "sint8", .invalid = 0x7F, .size = 1 }, // 1
-        .{ .name = "uint8", .invalid = 0xFF, .size = 1 }, // 2
-        .{ .name = "sint16", .invalid = 0x7FFF, .size = 2 }, // 3
-        .{ .name = "uint16", .invalid = 0xFFFF, .size = 2 }, // 4
-        .{ .name = "sint32", .invalid = 0x7FFFFFFF, .size = 4 }, // 5
-        .{ .name = "uint32", .invalid = 0xFFFFFFFF, .size = 4 }, // 6
-        .{ .name = "string", .invalid = 0x00, .size = 1 }, // 7
-        .{ .name = "float32", .invalid = 0xFFFFFFFF, .size = 4 }, // 8
-        .{ .name = "float64", .invalid = 0xFFFFFFFFFFFFFFFF, .size = 8 }, // 9
-        .{ .name = "uint8z", .invalid = 0x00, .size = 1 }, // 10
-        .{ .name = "uint16z", .invalid = 0x0000, .size = 2 }, // 11
-        .{ .name = "uint32z", .invalid = 0x00000000, .size = 4 }, // 12
-        .{ .name = "byte", .invalid = 0xFF, .size = 1 }, // 13
-        .{ .name = "sint64", .invalid = 0x7FFFFFFFFFFFFFFF, .size = 8 }, // 14
-        .{ .name = "uint64", .invalid = 0xFFFFFFFFFFFFFFFF, .size = 8 }, // 15
-        .{ .name = "uint64z", .invalid = 0x0000000000000000, .size = 8 }, // 16
-    };
-
-    fn decode(raw: u8) !BaseType {
-        const number = raw & 0x1F; // bits 0..4
-        if (number >= table.len) return FitError.InvalidBaseType;
-        const row = table[number];
-        return .{
-            .endian_ability = raw & 0x80 != 0, // bit 7
-            .name = row.name,
-            .invalid = row.invalid,
-            .size = row.size,
-            .number = number,
+    fn size(self: BaseType) u8 {
+        return switch (self) {
+            .enum_, .sint, .uint8, .string, .uint8z, .byte => 1,
+            .sint16, .uint16, .uint16z => 2,
+            .sint32, .uint32, .float32, .uint32z => 4,
+            .float64, .sint64, .uint64, .uint64z => 8,
         };
     }
 };
