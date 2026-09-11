@@ -99,6 +99,7 @@ const BaseType = struct {
     invalid: u64,
     /// Bytes per element.
     size: u8,
+    number: u8,
 
     /// Rows indexed by base type number (bits 0..4 of the base type field byte).
     /// See Table 7 of https://developer.garmin.com/fit/protocol/
@@ -131,6 +132,7 @@ const BaseType = struct {
             .name = row.name,
             .invalid = row.invalid,
             .size = row.size,
+            .number = number,
         };
     }
 };
@@ -256,10 +258,105 @@ pub const Parser = struct {
         self.data_message_index += 1;
         for (0..definition.num_fields) |i| {
             const field = definition.fields[i];
-            _ = try self.in.take(field.size);
-            self.data_read += field.size;
 
-            std.debug.print(" * unknown_{}: {s}\n", .{ field.field_definition_number, field.base_type.name });
+            std.debug.print(" * unknown_{}: {s} ", .{ field.field_definition_number, field.base_type.name });
+
+            const elements = @divExact(field.size, field.base_type.size);
+            for (0..elements) |j| {
+                _ = j;
+                switch (field.base_type.number) {
+                    0 => { // enum
+                        const value = try self.in.takeByte();
+                        if (value == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    1 => { // sint8
+                        const value = try self.in.takeInt(i8, .little);
+                        if (value == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    2 => { // uint8
+                        const value = try self.in.takeByte();
+                        if (value == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    3 => { // sint16
+                        const value = try self.in.takeInt(i16, try endian(definition.arch));
+                        if (value == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    4 => { // uint16
+                        const value = try self.in.takeInt(u16, try endian(definition.arch));
+                        if (value == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    5 => { // sint32
+                        const value = try self.in.takeInt(i32, try endian(definition.arch));
+                        if (value == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    6 => { // uint32
+                        const value = try self.in.takeInt(u32, try endian(definition.arch));
+                        if (value == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    7 => { // string
+                        const value = try self.in.takeByte();
+                        if (value == field.base_type.invalid) {
+                            std.debug.print("", .{});
+                        } else {
+                            std.debug.print("{c}", .{value});
+                        }
+                        // FIX: null terminated string
+                    },
+                    8 => { // float32
+                        const value_int = try self.in.takeInt(u32, try endian(definition.arch));
+                        if (value_int == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            const value: f32 = @bitCast(value_int);
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    9 => { // float64
+                        const value_int = try self.in.takeInt(u64, try endian(definition.arch));
+                        if (value_int == field.base_type.invalid) {
+                            std.debug.print("None", .{});
+                        } else {
+                            const value: f64 = @bitCast(value_int);
+                            std.debug.print("{}", .{value});
+                        }
+                    },
+                    // TODO add the rest of the variants
+                    else => {
+                        _ = try self.in.take(field.base_type.size);
+                    },
+                }
+                std.debug.print(", ", .{});
+            }
+            std.debug.print("\n", .{});
+            self.data_read += field.size;
         }
     }
 };
