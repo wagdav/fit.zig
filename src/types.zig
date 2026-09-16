@@ -1,0 +1,36 @@
+/// Global message ID 0, field 0.
+pub const File = enum(u8) {
+    device = 1,
+    settings = 2,
+    sport = 3,
+    activity = 4,
+    workout = 5,
+    course = 6,
+    schedules = 7,
+    weight = 9,
+    totals = 10,
+    goals = 11,
+    blood_pressure = 14,
+    monitoring_a = 15,
+    activity_summary = 20,
+    monitoring_daily = 28,
+    monitoring_b = 32,
+    segment = 34,
+    segment_list = 35,
+    exd_configuration = 40,
+    mfg_range_min = 0xf7,
+    mfg_range_max = 0xfe,
+};
+
+pub const Sport = enum(u8) {
+    generic = 0,
+    running = 1,
+    cycling = 2,
+    transition = 3,
+    fitness_equipment = 4,
+    swimming = 5,
+    walking = 6,
+    training = 10,
+    hiking = 17,
+    _,
+};

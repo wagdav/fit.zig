@@ -6,6 +6,12 @@ const Io = std.Io;
 const Reader = std.Io.Reader;
 const testing = std.testing;
 
+const profile = @import("profile.zig");
+const MesgNum = profile.MesgNum;
+const types = @import("types.zig");
+pub const File = types.File;
+pub const Sport = types.Sport;
+
 /// Information about the FIT File
 /// See Table 1 of https://developer.garmin.com/fit/protocol/
 const FileHeader = struct {
@@ -63,6 +69,13 @@ pub const FitError = error{
     InvalidArchitecture,
     InvalidBaseType,
     InvalidMagic,
+    CompressedTimestampUnsupported,
+    /// A view-struct field's wire arity did not match its target type.
+    ArityMismatch,
+    /// A field's wire base type is incompatible with its target type.
+    BaseTypeMismatch,
+    /// A required (non-optional) view-struct field was absent or invalid.
+    MissingField,
 };
 
 const max_fields = 256;
@@ -75,7 +88,7 @@ const DefinitionMessage = struct {
     num_fields: u8,
     fields: [max_fields]FieldDefinition,
     num_developer_fields: u8,
-    developer_fields: [max_developer_fields]DeveloperFieldDescription,
+    developer_fields: [max_developer_fields]DeveloperFieldDefinition,
 };
 
 /// See Table 5 of https://developer.garmin.com/fit/protocol/
@@ -83,6 +96,13 @@ const FieldDefinition = struct {
     field_definition_number: u8,
     size: u8,
     base_type: BaseType,
+};
+
+/// See Table 8 of https://developer.garmin.com/fit/protocol/
+const DeveloperFieldDefinition = struct {
+    field_definition_number: u8,
+    size: u8,
+    developer_data_index: u8,
 };
 
 fn endian(arch: u8) !Endian {
@@ -144,80 +164,197 @@ const BaseType = enum(u8) {
     }
 };
 
-/// See Table 8 of https://developer.garmin.com/fit/protocol/
-const DeveloperFieldDescription = struct {
-    field_definition_number: u8,
-    size: u8,
-    developer_data_index: u8,
-};
-
-/// Global message ID 207
-/// See Table 9 of https://developer.garmin.com/fit/protocol/
-const DeveloperDataIdMessage = struct {
-    application_id: [16]u8,
-    developer_data_index: u8,
-};
-
-/// Global message ID 206
-/// See Table 10 of https://developer.garmin.com/fit/protocol/
-const FieldDescriptionMessage = struct {
-    developer_data_index: u8,
-    field_definition_number: u8,
-    fit_base_type_id: u8,
-    field_name: [64]u8,
-    units: [16]u8,
-    native_field_num: u8,
-};
-
 const max_definitions = 16;
-const max_field_descriptions = 256;
+
+/// Total number of payload bytes a data message of this definition occupies.
+fn payloadSize(def: *const DefinitionMessage) u32 {
+    var n: u32 = 0;
+    for (def.fields[0..def.num_fields]) |f| n += f.size;
+    for (def.developer_fields[0..def.num_developer_fields]) |f| n += f.size;
+    return n;
+}
+
+/// Whether the definition declares a field with the given definition number.
+fn hasField(def: *const DefinitionMessage, number: u8) bool {
+    for (def.fields[0..def.num_fields]) |f| {
+        if (f.field_definition_number == number) return true;
+    }
+    return false;
+}
+
+/// `T` with any outer optional stripped (`?u32 -> u32`, `u32 -> u32`).
+fn Strip(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+}
+
+/// A view-struct field is required when it is non-optional and has no default:
+/// it must be filled from the wire, or `decode` fails. Optional or defaulted
+/// fields are always satisfied.
+fn isRequired(comptime f: std.builtin.Type.StructField) bool {
+    return f.defaultValue() == null and @typeInfo(f.type) != .optional;
+}
+
+/// A raw wire scalar, decoded to a size-independent representation so the
+/// target-type conversion can be a single instantiation per target.
+const Raw = union(enum) {
+    u: u64,
+    i: i64,
+    f: f64,
+};
+
+/// Convert a raw wire scalar to the view-struct target type. Returns `null`
+/// when the value cannot be represented (e.g. an out-of-range enum tag).
+fn convert(comptime Child: type, raw: Raw) ?Child {
+    return switch (@typeInfo(Child)) {
+        .int => switch (raw) {
+            .u => |u| @intCast(u),
+            .i => |i| @intCast(i),
+            .f => unreachable, // float wire value into an integer target
+        },
+        .float => switch (raw) {
+            .u => |u| @floatFromInt(u),
+            .i => |i| @floatFromInt(i),
+            .f => |f| @floatCast(f),
+        },
+        .@"enum" => switch (raw) {
+            .u => |u| std.enums.fromInt(Child, u),
+            .i => |i| std.enums.fromInt(Child, i),
+            .f => unreachable,
+        },
+        else => @compileError("unsupported scalar target: " ++ @typeName(Child)),
+    };
+}
+
+/// A parsed data message, valid only until the next `MessageIterator.next()`.
+/// Decode it into a view struct with `decode`, or ignore it and its payload is
+/// skipped automatically on the next iteration.
+pub const Message = struct {
+    parser: *Parser,
+    def: *const DefinitionMessage,
+    message_number: MesgNum,
+
+    /// Fill a view struct `T` from this message. `m` is the message number the
+    /// struct describes; it resolves `T`'s field names against the profile at
+    /// comptime. Optional fields absent from the message become `null`; a
+    /// required (non-optional) field that is absent or invalid is an error.
+    pub fn decode(msg: Message, comptime m: MesgNum, comptime T: type) !T {
+        assert(msg.message_number == m);
+        const self = msg.parser;
+        const def = msg.def;
+        const en = try endian(def.arch);
+        const sfields = @typeInfo(T).@"struct".fields;
+
+        // Seed optional and defaulted fields, and check that every required
+        // field is actually present in this message — leaving the read loop to
+        // just assign values.
+        var out: T = undefined;
+        inline for (sfields) |f| {
+            if (comptime f.defaultValue()) |d| {
+                @field(out, f.name) = d;
+            } else if (@typeInfo(f.type) == .optional) {
+                @field(out, f.name) = null;
+            } else if (!hasField(def, comptime profile.field(m, f.name).number)) {
+                return FitError.MissingField; // required but absent
+            }
+        }
+
+        // Read the wire in order, assigning matched fields and discarding the rest.
+        for (def.fields[0..def.num_fields]) |fdef| {
+            const assigned = try self.assignField(m, T, &out, fdef, en);
+            if (!assigned) try self.in.discardAll(fdef.size); // no field wanted it
+        }
+
+        // Developer fields are not decoded by the typed path; skip their bytes
+        // so the stream stays aligned for the next record.
+        for (def.developer_fields[0..def.num_developer_fields]) |dfd| {
+            try self.in.discardAll(dfd.size);
+        }
+
+        self.consumePending();
+        return out;
+    }
+};
+
+pub const MessageIterator = struct {
+    parser: *Parser,
+
+    pub fn next(self: MessageIterator) !?Message {
+        return self.parser.next();
+    }
+};
 
 pub const Parser = struct {
     in: *Reader,
     header: FileHeader,
     definitions: [max_definitions]DefinitionMessage,
-    /// Developer field descriptions (global message 206) collected while
-    /// parsing. Developer fields in data messages are decoded by looking up
-    /// their (developer_data_index, field_definition_number) pair here.
-    field_descriptions: [max_field_descriptions]FieldDescriptionMessage,
-    num_field_descriptions: u8,
     data_read: u32,
-    data_message_index: u32,
+    started: bool,
+    /// Bytes of the last-yielded data message not yet consumed (via `decode` or
+    /// an auto-skip). Valid-until-next-`next()` bookkeeping.
+    pending: ?u32,
 
     pub fn init(in: *Reader) Parser {
         return .{
-            .data_read = 0,
-            .data_message_index = 1,
             .in = in,
             .header = undefined,
             .definitions = undefined,
-            .field_descriptions = undefined,
-            .num_field_descriptions = 0,
+            .data_read = 0,
+            .started = false,
+            .pending = null,
         };
     }
 
-    fn lookupFieldDescription(self: *Parser, developer_data_index: u8, field_number: u8) ?FieldDescriptionMessage {
-        for (0..self.num_field_descriptions) |i| {
-            const d = self.field_descriptions[i];
-            if (d.developer_data_index == developer_data_index and
-                d.field_definition_number == field_number)
-            {
-                return d;
+    /// Iterate the data messages of the file. Parses the header lazily on the
+    /// first `next()`.
+    pub fn messages(self: *Parser) MessageIterator {
+        return .{ .parser = self };
+    }
+
+    fn consumePending(self: *Parser) void {
+        if (self.pending) |remaining| {
+            self.data_read += remaining;
+            self.pending = null;
+        }
+    }
+
+    fn next(self: *Parser) !?Message {
+        if (!self.started) {
+            try self.parseHeader();
+            self.data_read = 0;
+            self.started = true;
+        }
+
+        // A message yielded but never decoded still owns its payload bytes.
+        if (self.pending) |remaining| {
+            try self.in.discardAll(remaining);
+            self.data_read += remaining;
+            self.pending = null;
+        }
+
+        while (self.data_read < self.header.data_size) {
+            const rec: RecordHeader = .decode(try self.in.takeByte());
+            self.data_read += 1;
+            switch (rec) {
+                .normal => |h| {
+                    if (h.is_definition) {
+                        try self.parseDefinitionMessage(h);
+                    } else {
+                        const def = &self.definitions[h.local_message_type];
+                        self.pending = payloadSize(def);
+                        return .{
+                            .parser = self,
+                            .def = def,
+                            .message_number = @enumFromInt(def.global_message_number),
+                        };
+                    }
+                },
+                .compressed_timestamp => return FitError.CompressedTimestampUnsupported,
             }
         }
         return null;
-    }
-
-    pub fn parseFile(self: *Parser) !void {
-        try self.parseHeader();
-        std.debug.print("FileHeader: {}\n", .{self.header});
-
-        self.data_read = 0;
-        while (self.data_read < self.header.data_size) {
-            try self.parseRecord();
-        }
-        const crc = try self.in.takeInt(u16, .little);
-        _ = crc; // TODO Read CRC
     }
 
     fn parseHeader(self: *Parser) !void {
@@ -233,7 +370,7 @@ pub const Parser = struct {
 
         // Ignore the rest of the header
         if (size > 14) {
-            _ = try self.in.take(size - 14);
+            _ = try self.in.discardAll(size - 14);
         }
 
         self.header = .{
@@ -246,28 +383,8 @@ pub const Parser = struct {
         };
     }
 
-    fn parseRecord(self: *Parser) !void {
-        const header: RecordHeader = .decode(try self.in.takeByte());
-        self.data_read += 1;
-
-        // Decode Record Content
-        switch (header) {
-            .normal => |h| { // Normal Header
-                if (h.is_definition) {
-                    try self.parseDefinitionMessage(h);
-                } else {
-                    try self.parseDataMessage(h);
-                }
-            },
-            .compressed_timestamp => |h| {
-                _ = h;
-                unreachable; // Cannot read compressed timestamps yet
-            },
-        }
-    }
-
     fn parseDefinitionMessage(self: *Parser, header: RecordHeader.Normal) !void {
-        _ = try self.in.take(1); // skip reserved field
+        _ = try self.in.discardAll(1); // skip reserved field
         const arch = try self.in.takeByte();
         const global_message_number = try self.in.takeInt(u16, try endian(arch));
         const num_fields = try self.in.takeByte();
@@ -284,17 +401,15 @@ pub const Parser = struct {
 
         for (0..definition.num_fields) |i| {
             const field_definition_number = try self.in.takeByte();
-            const size = try self.in.takeByte();
-            const base_type = try self.in.takeByte(); // TODO: Decode accordng to Table 6.
+            const field_size = try self.in.takeByte();
+            const base_type = try self.in.takeByte();
             self.data_read += 3;
 
-            const field: FieldDefinition = .{
+            definition.fields[i] = .{
                 .field_definition_number = field_definition_number,
-                .size = size,
+                .size = field_size,
                 .base_type = try .decode(base_type),
             };
-
-            definition.fields[i] = field;
         }
 
         // Parse Developer Data Fields
@@ -316,150 +431,116 @@ pub const Parser = struct {
         self.definitions[header.local_message_type] = definition;
     }
 
-    fn parseDataMessage(self: *Parser, header: RecordHeader.Normal) !void {
-        // In data messages and this should be set to zero (false)
-        assert(!header.has_developer_data);
-
-        // Look up the local message type
-        const definition = self.definitions[header.local_message_type];
-
-        // Field description messages (global message 206) declare the type,
-        // name and units of developer fields. Capture them into the registry
-        // so later developer fields can be decoded.
-        if (definition.global_message_number == 206) {
-            return self.parseFieldDescriptionMessage(definition);
-        }
-
-        // Print the data message type
-        std.debug.print("{}. unknown_{}\n", .{ self.data_message_index, definition.global_message_number });
-        self.data_message_index += 1;
-
-        const en = try endian(definition.arch);
-
-        // Run through all data fields
-        for (0..definition.num_fields) |i| {
-            const field = definition.fields[i];
-
-            std.debug.print(" * unknown_{}: ", .{field.field_definition_number});
-            try self.printField(field.base_type, field.size, en);
-            std.debug.print("\n", .{});
-
-            self.data_read += field.size;
-        }
-
-        // Developer fields carry no type in the definition; decode each one via
-        // its field description, matched on (developer_data_index, field_number).
-        for (0..definition.num_developer_fields) |i| {
-            const field = definition.developer_fields[i];
-
-            if (self.lookupFieldDescription(field.developer_data_index, field.field_definition_number)) |desc| {
-                const base_type = try BaseType.decode(desc.fit_base_type_id);
-                std.debug.print(" * {s}: ", .{std.mem.sliceTo(&desc.field_name, 0)});
-                try self.printField(base_type, field.size, en);
-
-                const units = std.mem.sliceTo(&desc.units, 0);
-                if (units.len > 0) std.debug.print(" [{s}]", .{units});
-                std.debug.print("\n", .{});
-            } else {
-                // No description was seen for this field; skip its bytes.
-                std.debug.print(" * developer_{}_{}: ???\n", .{ field.developer_data_index, field.field_definition_number });
-                _ = try self.in.take(field.size);
+    /// Assign wire field `fdef` to the matching field of `out`, reading its
+    /// value. Returns whether a struct field matched; if none did, the caller
+    /// skips the field's bytes.
+    fn assignField(self: *Parser, comptime m: MesgNum, comptime T: type, out: *T, fdef: FieldDefinition, en: Endian) !bool {
+        inline for (@typeInfo(T).@"struct".fields) |f| {
+            const number = comptime profile.field(m, f.name).number;
+            if (fdef.field_definition_number == number) {
+                if (try self.readField(Strip(f.type), fdef, en)) |value| {
+                    @field(out, f.name) = value;
+                } else if (comptime isRequired(f)) {
+                    return FitError.MissingField; // required, present but invalid
+                } // else: optional stays null, or defaulted keeps its default
+                return true;
             }
-
-            self.data_read += field.size;
         }
+        return false;
     }
 
-    /// Parse a field description message (global message 206, Table 10) and add
-    /// it to the registry. Fields are read according to the definition and
-    /// dispatched by their field definition number.
-    fn parseFieldDescriptionMessage(self: *Parser, definition: DefinitionMessage) !void {
-        var desc: FieldDescriptionMessage = std.mem.zeroes(FieldDescriptionMessage);
-
-        for (0..definition.num_fields) |i| {
-            const field = definition.fields[i];
-            switch (field.field_definition_number) {
-                0 => desc.developer_data_index = try self.in.takeByte(),
-                1 => desc.field_definition_number = try self.in.takeByte(),
-                2 => desc.fit_base_type_id = try self.in.takeByte(),
-                3 => @memcpy(desc.field_name[0..field.size], try self.in.take(field.size)),
-                8 => @memcpy(desc.units[0..field.size], try self.in.take(field.size)),
-                15 => desc.native_field_num = try self.in.takeByte(),
-                else => _ = try self.in.take(field.size),
-            }
-            self.data_read += field.size;
-        }
-
-        self.field_descriptions[self.num_field_descriptions] = desc;
-        self.num_field_descriptions += 1;
-    }
-
-    /// Read a single field value (possibly an array) and print it.
-    fn printField(self: *Parser, base_type: BaseType, size: u8, en: Endian) !void {
-        const invalid = base_type.invalid();
-
-        // special case for strings
-        if (base_type == .string) {
-            const bytes = try self.in.take(size);
-            std.debug.print("{s}", .{std.mem.sliceTo(bytes, 0)});
-            return;
-        }
-
-        const elements = @divExact(size, base_type.size());
-        const is_array = elements > 1;
-
-        if (is_array) std.debug.print("(", .{}); // opening paren
-
-        for (0..elements) |j| {
-            switch (base_type) {
-                .enum_ => printOptional(try self.takeField(u8, en, invalid)),
-                .sint8 => printOptional(try self.takeField(i8, en, invalid)),
-                .uint8 => printOptional(try self.takeField(u8, en, invalid)),
-                .sint16 => printOptional(try self.takeField(i16, en, invalid)),
-                .uint16 => printOptional(try self.takeField(u16, en, invalid)),
-                .sint32 => printOptional(try self.takeField(i32, en, invalid)),
-                .uint32 => printOptional(try self.takeField(u32, en, invalid)),
-                .string => {}, // already handled
-                .float32 => printOptional(try self.takeField(f32, en, invalid)),
-                .float64 => printOptional(try self.takeField(f64, en, invalid)),
-                .uint8z => printOptional(try self.takeField(u8, en, invalid)),
-                .uint16z => printOptional(try self.takeField(u16, en, invalid)),
-                .uint32z => printOptional(try self.takeField(u32, en, invalid)),
-                .byte => printOptional(try self.takeField(u8, en, invalid)),
-                .sint64 => printOptional(try self.takeField(i64, en, invalid)),
-                .uint64 => printOptional(try self.takeField(u64, en, invalid)),
-                .uint64z => printOptional(try self.takeField(u64, en, invalid)),
-            }
-            if (is_array) {
-                if (j < elements - 1) std.debug.print(", ", .{}); // separator
-                if (j == elements - 1) std.debug.print(")", .{}); // closing paren
-            }
-        }
-    }
-
-    fn takeField(self: *Parser, comptime T: type, en: Endian, invalid: u64) !?T {
-        switch (@typeInfo(T)) {
-            .int => {
-                const value = try self.in.takeInt(T, en);
-                return if (value == invalid) null else value;
+    /// Read one view-struct field. Returns `null` when the field carries the
+    /// FIT "invalid" sentinel.
+    fn readField(self: *Parser, comptime Child: type, fdef: FieldDefinition, en: Endian) !?Child {
+        const base = fdef.base_type;
+        switch (@typeInfo(Child)) {
+            .int, .float, .@"enum" => {
+                if (base == .string) return FitError.BaseTypeMismatch;
+                if (@divExact(fdef.size, base.size()) != 1) return FitError.ArityMismatch;
+                return self.readScalar(Child, base, en);
             },
-            .float => {
-                const Bits = @Int(.unsigned, @bitSizeOf(T));
-                const bits = try self.in.takeInt(Bits, en);
-                return if (bits == invalid) null else @bitCast(bits);
+            .array => |arr| {
+                if (arr.child == u8 and (base == .string or base == .byte)) {
+                    return try self.readString(Child, fdef);
+                }
+                if (@divExact(fdef.size, base.size()) != arr.len) return FitError.ArityMismatch;
+                var out: Child = undefined;
+                for (&out) |*slot| {
+                    slot.* = (try self.readScalar(arr.child, base, en)) orelse std.mem.zeroes(arr.child);
+                }
+                return out;
             },
-            else => unreachable,
+            else => @compileError("unsupported view field type: " ++ @typeName(Child)),
         }
+    }
+
+    fn readScalar(self: *Parser, comptime Child: type, base: BaseType, en: Endian) !?Child {
+        const raw = (try self.readRaw(base, en)) orelse return null;
+        return convert(Child, raw);
+    }
+
+    /// Read one raw scalar per its wire base type. Returns `null` on the invalid
+    /// sentinel.
+    fn readRaw(self: *Parser, base: BaseType, en: Endian) !?Raw {
+        const invalid = base.invalid();
+        switch (base) {
+            .enum_, .uint8, .uint8z, .byte => {
+                const v = try self.in.takeByte();
+                return if (v == invalid) null else .{ .u = v };
+            },
+            .sint8 => {
+                const v = try self.in.takeInt(i8, en);
+                return if (@as(u8, @bitCast(v)) == invalid) null else .{ .i = v };
+            },
+            .uint16, .uint16z => {
+                const v = try self.in.takeInt(u16, en);
+                return if (v == invalid) null else .{ .u = v };
+            },
+            .sint16 => {
+                const v = try self.in.takeInt(i16, en);
+                return if (@as(u16, @bitCast(v)) == invalid) null else .{ .i = v };
+            },
+            .uint32, .uint32z => {
+                const v = try self.in.takeInt(u32, en);
+                return if (v == invalid) null else .{ .u = v };
+            },
+            .sint32 => {
+                const v = try self.in.takeInt(i32, en);
+                return if (@as(u32, @bitCast(v)) == invalid) null else .{ .i = v };
+            },
+            .float32 => {
+                const b = try self.in.takeInt(u32, en);
+                return if (b == invalid) null else .{ .f = @as(f32, @bitCast(b)) };
+            },
+            .uint64, .uint64z => {
+                const v = try self.in.takeInt(u64, en);
+                return if (v == invalid) null else .{ .u = v };
+            },
+            .sint64 => {
+                const v = try self.in.takeInt(i64, en);
+                return if (@as(u64, @bitCast(v)) == invalid) null else .{ .i = v };
+            },
+            .float64 => {
+                const b = try self.in.takeInt(u64, en);
+                return if (b == invalid) null else .{ .f = @as(f64, @bitCast(b)) };
+            },
+            .string => return FitError.BaseTypeMismatch,
+        }
+    }
+
+    /// Read a string/byte field into a fixed `[N]u8`, truncated to `N`. The full
+    /// wire `size` is consumed regardless.
+    fn readString(self: *Parser, comptime Child: type, fdef: FieldDefinition) !Child {
+        const bytes = try self.in.take(fdef.size);
+        const text = std.mem.sliceTo(bytes, 0);
+        var out: Child = @splat(0);
+        const n = @min(out.len, text.len);
+        @memcpy(out[0..n], text[0..n]);
+        return out;
     }
 };
 
-fn printOptional(value: anytype) void {
-    if (value) |v| {
-        std.debug.print("{d}", .{v});
-    } else {
-        std.debug.print("None", .{});
-    }
-}
+// ------------------------------------------------------------------ tests ---
 
 // https://github.com/garmin/fit-java-sdk/blob/main/src/test/java/com/garmin/fit/TestData.java
 const fit_file_short = [_]u8{
@@ -483,14 +564,17 @@ test "parse header" {
         .data_type = .{ '.', 'F', 'I', 'T' },
         .crc = 41870,
     }, parser.header);
-
-    try parser.parseRecord();
 }
 
-test "parse minimal" {
+test "iterate short file" {
     var r: Reader = .fixed(&fit_file_short);
     var parser: Parser = .init(&r);
-    try parser.parseFile();
+
+    var it = parser.messages();
+    var count: usize = 0;
+    while (try it.next()) |_| count += 1;
+
+    try testing.expectEqual(1, count);
 }
 
 /// Comptime helper: a fixed-size, zero-padded byte array holding a string.
@@ -591,13 +675,95 @@ const fit_file_figure_14 =
     // CRC (2 bytes, ignored by the parser)
     [_]u8{ 0x00, 0x00 };
 
-test "parse figure 14" {
+const FileId = struct {
+    type: File,
+    manufacturer: u16,
+    product: u16,
+    serial_number: ?u32,
+    time_created: u32,
+};
+
+const Record = struct {
+    heart_rate: u8,
+    cadence: u8,
+    distance: u32,
+    speed: ?u16,
+};
+
+test "decode figure 14" {
     var r: Reader = .fixed(&fit_file_figure_14);
     var parser: Parser = .init(&r);
+    var it = parser.messages();
 
-    try parser.parseFile();
+    var file_ids: usize = 0;
+    var records: usize = 0;
 
-    try testing.expectEqual(14, parser.header.size);
-    try testing.expectEqual(222, parser.header.data_size);
-    try testing.expectEqualSlices(u8, ".FIT", &parser.header.data_type);
+    while (try it.next()) |msg| {
+        switch (msg.message_number) {
+            .file_id => {
+                const f = try msg.decode(.file_id, FileId);
+                file_ids += 1;
+                try testing.expectEqual(File.activity, f.type);
+                try testing.expectEqual(15, f.manufacturer);
+                try testing.expectEqual(22, f.product);
+                try testing.expectEqual(1234, f.serial_number);
+                try testing.expectEqual(621463080, f.time_created);
+            },
+            .record => {
+                const rec = try msg.decode(.record, Record);
+                records += 1;
+                switch (records) {
+                    1 => {
+                        try testing.expectEqual(140, rec.heart_rate);
+                        try testing.expectEqual(88, rec.cadence);
+                        try testing.expectEqual(510, rec.distance);
+                        try testing.expectEqual(2800, rec.speed);
+                    },
+                    3 => {
+                        try testing.expectEqual(144, rec.heart_rate);
+                        try testing.expectEqual(3050, rec.speed);
+                    },
+                    else => {},
+                }
+            },
+            else => {}, // developer_data_id / field_description: auto-skipped
+        }
+    }
+
+    try testing.expectEqual(1, file_ids);
+    try testing.expectEqual(3, records);
+}
+
+test "readField string and numeric array" {
+    var r: Reader = .fixed(&[_]u8{
+        'h', 'i', 0, 0, // string, size 4
+        0x0A, 0x00, 0x14, 0x00, // uint16[2] = { 10, 20 }
+    });
+    var p: Parser = .init(&r);
+
+    const s = try p.readField([4]u8, .{ .field_definition_number = 0, .size = 4, .base_type = .string }, .little);
+    try testing.expectEqualStrings("hi", std.mem.sliceTo(&s.?, 0));
+
+    const arr = try p.readField([2]u16, .{ .field_definition_number = 1, .size = 4, .base_type = .uint16 }, .little);
+    try testing.expectEqual([2]u16{ 10, 20 }, arr.?);
+}
+
+test "arity mismatch: scalar target for an array field" {
+    var r: Reader = .fixed(&[_]u8{ 0x01, 0x00, 0x02, 0x00 });
+    var p: Parser = .init(&r);
+    // wire holds 2 x uint16 but the target is a scalar
+    try testing.expectError(FitError.ArityMismatch, p.readField(u16, .{ .field_definition_number = 0, .size = 4, .base_type = .uint16 }, .little));
+}
+
+test "iterate figure 14 without decoding" {
+    // Every message auto-skips; the whole file drains cleanly.
+    var r: Reader = .fixed(&fit_file_figure_14);
+    var parser: Parser = .init(&r);
+    var it = parser.messages();
+
+    var count: usize = 0;
+    while (try it.next()) |_| count += 1;
+
+    // file_id, developer_data_id, field_description, 3x record
+    try testing.expectEqual(6, count);
 }
