@@ -8,9 +8,7 @@ const testing = std.testing;
 
 const profile = @import("profile.zig");
 const MesgNum = profile.MesgNum;
-const types = @import("types.zig");
-pub const File = types.File;
-pub const Sport = types.Sport;
+pub const Types = @import("types.zig");
 
 /// Information about the FIT File
 /// See Table 1 of https://developer.garmin.com/fit/protocol/
@@ -676,7 +674,7 @@ const fit_file_figure_14 =
     [_]u8{ 0x00, 0x00 };
 
 const FileId = struct {
-    type: File,
+    type: Types.File,
     manufacturer: u16,
     product: u16,
     serial_number: ?u32,
@@ -703,7 +701,7 @@ test "decode figure 14" {
             .file_id => {
                 const f = try msg.decode(.file_id, FileId);
                 file_ids += 1;
-                try testing.expectEqual(File.activity, f.type);
+                try testing.expectEqual(Types.File.activity, f.type);
                 try testing.expectEqual(15, f.manufacturer);
                 try testing.expectEqual(22, f.product);
                 try testing.expectEqual(1234, f.serial_number);
