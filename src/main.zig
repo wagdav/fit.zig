@@ -40,12 +40,15 @@ pub fn main(init: std.process.Init) !void {
     defer track.deinit(gpa);
     var summary: ?Summary = null;
 
+    const MesgNum = std.meta.fieldInfo(fit.Message, .message_number).type;
+    var discarded: std.EnumSet(MesgNum) = .initEmpty();
+
     var parser: fit.Parser = .init(in);
     var it = parser.messages();
     while (try it.next()) |msg| switch (msg.message_number) {
         .session => summary = try msg.decode(.session, Summary),
         .record => try track.append(gpa, try msg.decode(.record, Point)),
-        else => {}, // everything else auto-skips
+        else => discarded.insert(msg.message_number),
     };
 
     if (summary) |s| {
@@ -69,6 +72,22 @@ pub fn main(init: std.process.Init) !void {
     try out.print("records:    {d} ({d} with GPS)\n", .{ track.items.len, with_gps });
     if (first) |a| try out.print("start:      {d:.5}, {d:.5}\n", .{ degrees(a.position_lat.?), degrees(a.position_long.?) });
     if (last) |b| try out.print("end:        {d:.5}, {d:.5}\n", .{ degrees(b.position_lat.?), degrees(b.position_long.?) });
+
+    if (discarded.count() > 0) {
+        try out.print("discarded:  ", .{});
+        var first_discarded = true;
+        var iter = discarded.iterator();
+        while (iter.next()) |m| {
+            if (!first_discarded) try out.print(", ", .{});
+            first_discarded = false;
+            if (std.enums.tagName(MesgNum, m)) |name| {
+                try out.print("{s}", .{name});
+            } else {
+                try out.print("{d}", .{@intFromEnum(m)});
+            }
+        }
+        try out.print("\n", .{});
+    }
 
     try out.flush();
 }

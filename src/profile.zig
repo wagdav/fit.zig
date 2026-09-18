@@ -25,10 +25,24 @@ const RawField = struct {
 /// unnamed value, which a `switch (msg.message_number)` handles via `else`.
 pub const MesgNum = enum(u16) {
     file_id = 0,
+    capabilities = 1,
+    device_settings = 2,
+    user_profile = 3,
+    zones_target = 7,
+    sport = 12,
+    training_settings = 13,
     session = 18,
+    lap = 19,
     record = 20,
+    event = 21,
+    device_info = 23,
+    activity = 34,
+    training_file = 72,
     field_description = 206,
     developer_data_id = 207,
+    time_in_zone = 216,
+    climb_pro = 317,
+    device_aux_battery_info = 375,
     _,
 };
 
