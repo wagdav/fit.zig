@@ -24,24 +24,25 @@ def main():
 
     # Activity summary — from the single `session` message.
     summary = None
-    for msg in fit.get_messages("session"):
-        summary = {
-            "sport": msg.get_value("sport"),
-            "total_distance": msg.get_value("total_distance"),          # metres
-            "total_elapsed_time": msg.get_value("total_elapsed_time"),  # seconds
-        }
-        break
+    track = []
+    for msg in fit.get_messages():
+        if msg.mesg_type is None:
+            continue
 
-    # Track — from each `record` message.
-    track = [
-        {
-            "position_lat": msg.get_value("position_lat"),   # semicircles
-            "position_long": msg.get_value("position_long"),
-            "altitude": msg.get_value("altitude"),
-            "heart_rate": msg.get_value("heart_rate"),
-        }
-        for msg in fit.get_messages("record")
-    ]
+        if msg.mesg_type.name == "session":
+            summary = {
+                "sport": msg.get_value("sport"),
+                "total_distance": msg.get_value("total_distance"),          # metres
+                "total_elapsed_time": msg.get_value("total_elapsed_time"),  # seconds
+            }
+
+        if msg.mesg_type.name == "record":
+            track.append( {
+                "position_lat": msg.get_value("position_lat"),   # semicircles
+                "position_long": msg.get_value("position_long"),
+                "altitude": msg.get_value("altitude"),
+                "heart_rate": msg.get_value("heart_rate"),
+            })
 
     if summary is not None:
         sport = summary["sport"] if summary["sport"] is not None else "?"
