@@ -320,7 +320,7 @@ pub const Parser = struct {
 
     fn next(self: *Parser) !?Message {
         if (!self.started) {
-            try self.parseHeader();
+            self.header = try self.parseHeader();
             self.data_read = 0;
             self.started = true;
         }
@@ -355,7 +355,7 @@ pub const Parser = struct {
         return null;
     }
 
-    fn parseHeader(self: *Parser) !void {
+    fn parseHeader(self: *Parser) !FileHeader {
         const size = try self.in.takeByte();
         const protocol_version = try self.in.takeByte();
         const profile_version = try self.in.takeInt(u16, .little);
@@ -371,7 +371,7 @@ pub const Parser = struct {
             _ = try self.in.discardAll(size - 14);
         }
 
-        self.header = .{
+        return .{
             .size = size,
             .protocol_version = protocol_version,
             .profile_version = profile_version,
@@ -552,8 +552,6 @@ test "parse header" {
     var r: Reader = .fixed(&fit_file_short);
     var parser: Parser = .init(&r);
 
-    try parser.parseHeader();
-
     try testing.expectEqualDeep(FileHeader{
         .size = 14,
         .protocol_version = 32,
@@ -561,7 +559,7 @@ test "parse header" {
         .data_size = 36,
         .data_type = .{ '.', 'F', 'I', 'T' },
         .crc = 41870,
-    }, parser.header);
+    }, try parser.parseHeader());
 }
 
 test "iterate short file" {
