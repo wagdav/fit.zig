@@ -558,6 +558,11 @@ pub const Parser = struct {
     }
 };
 
+/// Convert a lat/lon coordinate from semicircles to degrees
+pub fn degrees(semicircles: i32) f64 {
+    return @as(f64, @floatFromInt(semicircles)) * (180.0 / 2147483648.0);
+}
+
 // ------------------------------------------------------------------ tests ---
 
 // https://github.com/garmin/fit-java-sdk/blob/main/src/test/java/com/garmin/fit/TestData.java

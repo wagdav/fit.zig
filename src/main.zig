@@ -19,10 +19,6 @@ const Point = struct {
     heart_rate: ?u8,
 };
 
-fn degrees(semicircles: i32) f64 {
-    return @as(f64, @floatFromInt(semicircles)) * (180.0 / 2147483648.0);
-}
-
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = std.heap.page_allocator;
@@ -70,8 +66,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     try out.print("records:    {d} ({d} with GPS)\n", .{ track.items.len, with_gps });
-    if (first) |a| try out.print("start:      {d:.5}, {d:.5}\n", .{ degrees(a.position_lat.?), degrees(a.position_long.?) });
-    if (last) |b| try out.print("end:        {d:.5}, {d:.5}\n", .{ degrees(b.position_lat.?), degrees(b.position_long.?) });
+    if (first) |a| try out.print("start:      {d:.5}, {d:.5}\n", .{
+        fit.degrees(a.position_lat.?),
+        fit.degrees(a.position_long.?),
+    });
+    if (last) |b| try out.print("end:        {d:.5}, {d:.5}\n", .{
+        fit.degrees(b.position_lat.?),
+        fit.degrees(b.position_long.?),
+    });
 
     if (discarded.count() > 0) {
         try out.print("discarded:  ", .{});
