@@ -181,7 +181,7 @@ fn hasField(def: *const DefinitionMessage, number: u8) bool {
 }
 
 /// `T` with any outer optional stripped (`?u32 -> u32`, `u32 -> u32`).
-fn Strip(comptime T: type) type {
+fn StripOptional(comptime T: type) type {
     return switch (@typeInfo(T)) {
         .optional => |o| o.child,
         else => T,
@@ -432,23 +432,44 @@ pub const Parser = struct {
     /// Assign wire field `fdef` to the matching field of `out`, reading its
     /// value. Returns whether a struct field matched; if none did, the caller
     /// skips the field's bytes.
-    fn assignField(self: *Parser, comptime m: MesgNum, comptime T: type, out: *T, fdef: FieldDefinition, en: Endian) !bool {
-        inline for (@typeInfo(T).@"struct".fields) |f| {
-            const number = comptime profile.field(m, f.name).number;
-            if (fdef.field_definition_number == number) {
-                if (try self.readField(Strip(f.type), fdef, en)) |value| {
-                    @field(out, f.name) = value;
-                } else if (comptime isRequired(f)) {
+    fn assignField(
+        self: *Parser,
+        comptime m: MesgNum,
+        comptime T: type,
+        out: *T,
+        fdef: FieldDefinition,
+        en: Endian,
+    ) !bool {
+        inline for (@typeInfo(T).@"struct".fields) |view_field| {
+            const field = comptime profile.field(m, view_field.name);
+            if (fdef.field_definition_number == field.number) {
+                // The underlying type of the view struct's field
+                const ftype = StripOptional(view_field.type);
+
+                if (try self.readField(ftype, fdef, en)) |raw| {
+                    // Scale/Offset: When specified, the binary quantity is divided by the scale factor and then the offset is
+                    // subtracted, yielding a floating point quantity.
+                    if (comptime profile.needsFloatTarget(field) and @typeInfo(ftype) != .float)
+                        @compileError(@typeName(T) ++ "." ++ view_field.name ++ " should be float because the field uses scale/offset.");
+
+                    var value = raw;
+                    if (field.scale) |scale| value /= scale;
+                    if (field.offset) |offset| value -= offset;
+
+                    // assign the field's value
+                    @field(out, view_field.name) = value;
+                } else if (comptime isRequired(view_field)) {
                     return FitError.MissingField; // required, present but invalid
-                } // else: optional stays null, or defaulted keeps its default
+                } else {
+                    // optional stays null, or defaulted keeps its default
+                }
                 return true;
             }
         }
         return false;
     }
 
-    /// Read one view-struct field. Returns `null` when the field carries the
-    /// FIT "invalid" sentinel.
+    /// Read one view-struct field. Returns `null` when the field carries the FIT "invalid" sentinel.
     fn readField(self: *Parser, comptime Child: type, fdef: FieldDefinition, en: Endian) !?Child {
         const base = fdef.base_type;
         switch (@typeInfo(Child)) {
@@ -477,8 +498,7 @@ pub const Parser = struct {
         return convert(Child, raw);
     }
 
-    /// Read one raw scalar per its wire base type. Returns `null` on the invalid
-    /// sentinel.
+    /// Read one raw scalar per its wire base type. Returns `null` on the invalid sentinel.
     fn readRaw(self: *Parser, base: BaseType, en: Endian) !?Raw {
         const invalid = base.invalid();
         switch (base) {
@@ -682,8 +702,15 @@ const FileId = struct {
 const Record = struct {
     heart_rate: u8,
     cadence: u8,
-    distance: u32,
-    speed: ?u16,
+    distance: f32,
+    speed: ?f16,
+    // Not present on the wire in the figure-14 fixture below, so this always
+    // decodes to `null`. It's included so `decode(.record, Record)` still
+    // instantiates `assignField`'s scale/offset compile-time check against
+    // `altitude` (scale = 5, offset = 500): this field is a regression guard
+    // that `Record.altitude` stays a float. Changing it back to an integer
+    // (e.g. `?u16`) must fail to compile — see `profile.needsFloatTarget`.
+    altitude: ?f16,
 };
 
 test "decode figure 14" {
@@ -712,12 +739,16 @@ test "decode figure 14" {
                     1 => {
                         try testing.expectEqual(140, rec.heart_rate);
                         try testing.expectEqual(88, rec.cadence);
-                        try testing.expectEqual(510, rec.distance);
-                        try testing.expectEqual(2800, rec.speed);
+                        try testing.expectEqual(5.1, rec.distance);
+                        try testing.expectEqual(2.8, rec.speed);
+                    },
+                    2 => {
+                        try testing.expectEqual(143, rec.heart_rate);
+                        try testing.expectEqual(2.92, rec.speed);
                     },
                     3 => {
                         try testing.expectEqual(144, rec.heart_rate);
-                        try testing.expectEqual(3050, rec.speed);
+                        try testing.expectEqual(3.05, rec.speed);
                     },
                     else => {},
                 }

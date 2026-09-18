@@ -4,21 +4,18 @@ const Io = std.Io;
 const fit = @import("fit_zig");
 const Sport = fit.Types.Sport;
 
-/// Activity summary — from the single `session` message. Fields are optional so
-/// a file missing any of them still decodes. Scale is applied here by the caller
-/// (the library returns raw carrier values): distance is centimetres, elapsed
-/// time is milliseconds.
+/// Activity summary — from the single `session` message.
 const Summary = struct {
     sport: Sport,
-    total_distance: u32,
-    total_elapsed_time: u32,
+    total_distance: f32,
+    total_elapsed_time: f32,
 };
 
 /// A track point — from each `record` message. Positions are raw semicircles.
 const Point = struct {
     position_lat: ?i32,
     position_long: ?i32,
-    altitude: ?u16,
+    altitude: ?f16,
     heart_rate: ?u8,
 };
 
@@ -53,8 +50,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (summary) |s| {
         try out.print("sport:      {?s}\n", .{std.enums.tagName(Sport, s.sport)});
-        try out.print("distance:   {d:.2} km\n", .{@as(f64, @floatFromInt(s.total_distance)) / 100_000.0});
-        try out.print("elapsed:    {d:.0} s\n", .{@as(f64, @floatFromInt(s.total_elapsed_time)) / 1000.0});
+        try out.print("distance:   {d:.2} km\n", .{s.total_distance / 1000.0});
+        try out.print("elapsed:    {d:.0} s\n", .{s.total_elapsed_time});
     } else {
         try out.print("(no session message)\n", .{});
     }
