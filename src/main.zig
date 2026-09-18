@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (summary) |s| {
-        try out.print("sport:      {}\n", .{s.sport});
+        try out.print("sport:      {?s}\n", .{std.enums.tagName(fit.Sport, s.sport)});
         try out.print("distance:   {d:.2} km\n", .{@as(f64, @floatFromInt(s.total_distance)) / 100_000.0});
         try out.print("elapsed:    {d:.0} s\n", .{@as(f64, @floatFromInt(s.total_elapsed_time)) / 1000.0});
     } else {
