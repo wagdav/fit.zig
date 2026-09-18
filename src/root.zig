@@ -242,7 +242,7 @@ pub const Message = struct {
     /// required (non-optional) field that is absent or invalid is an error.
     pub fn decode(msg: Message, comptime m: MesgNum, comptime T: type) !T {
         assert(msg.message_number == m);
-        const self = msg.parser;
+        const parser = msg.parser;
         const def = msg.def;
         const en = try endian(def.arch);
         const sfields = @typeInfo(T).@"struct".fields;
@@ -263,17 +263,17 @@ pub const Message = struct {
 
         // Read the wire in order, assigning matched fields and discarding the rest.
         for (def.fields[0..def.num_fields]) |fdef| {
-            const assigned = try self.assignField(m, T, &out, fdef, en);
-            if (!assigned) try self.in.discardAll(fdef.size); // no field wanted it
+            const assigned = try parser.assignField(m, T, &out, fdef, en);
+            if (!assigned) try parser.in.discardAll(fdef.size); // no field wanted it
         }
 
         // Developer fields are not decoded by the typed path; skip their bytes
         // so the stream stays aligned for the next record.
         for (def.developer_fields[0..def.num_developer_fields]) |dfd| {
-            try self.in.discardAll(dfd.size);
+            try parser.in.discardAll(dfd.size);
         }
 
-        self.consumePending();
+        parser.consumePending();
         return out;
     }
 };
