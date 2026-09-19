@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     defer track.deinit(gpa);
     var summary: ?Summary = null;
 
-    const MesgNum = std.meta.fieldInfo(fit.Message, .message_number).type;
+    const MesgNum = fit.MesgNum;
     var discarded: std.EnumSet(MesgNum) = .initEmpty();
 
     var parser: fit.Parser = .init(in);

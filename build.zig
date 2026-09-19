@@ -89,6 +89,28 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // `fitdump`, a clone of python-fitparse's fitdump, which reads a FIT file
+    // from stdin and prints its messages
+    const fitdump = b.addExecutable(.{
+        .name = "fitdump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fitdump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "fit", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(fitdump);
+
+    // `zig build fitdump` builds and runs it, piping stdin straight through.
+    const fitdump_step = b.step("fitdump", "Run fitdump (reads a FIT file from stdin)");
+    const fitdump_cmd = b.addRunArtifact(fitdump);
+    fitdump_step.dependOn(&fitdump_cmd.step);
+    fitdump_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| fitdump_cmd.addArgs(args);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

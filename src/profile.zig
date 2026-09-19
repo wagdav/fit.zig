@@ -16,9 +16,9 @@ const RawField = struct {
     number: u8,
     name: []const u8,
     type: type,
-    scale: ?comptime_int,
-    offset: ?comptime_int,
-    units: ?[]const u8,
+    scale: ?comptime_int = null,
+    offset: ?comptime_int = null,
+    units: ?[]const u8 = null,
 };
 
 /// Global message number. Non-exhaustive: any unrecognized number decodes to an
@@ -47,32 +47,32 @@ pub const MesgNum = enum(u16) {
 };
 
 const file_id: []const RawField = &.{
-    .{ .number = 0, .name = "type", .type = types.File, .scale = null, .offset = null, .units = null },
-    .{ .number = 1, .name = "manufacturer", .type = u16, .scale = null, .offset = null, .units = null },
-    .{ .number = 2, .name = "product", .type = u16, .scale = null, .offset = null, .units = null },
-    .{ .number = 3, .name = "serial_number", .type = u32, .scale = null, .offset = null, .units = null },
-    .{ .number = 4, .name = "time_created", .type = u32, .scale = null, .offset = null, .units = null }, // date_time carrier
-    .{ .number = 5, .name = "number", .type = u16, .scale = null, .offset = null, .units = null },
-    .{ .number = 8, .name = "product_name", .type = [16]u8, .scale = null, .offset = null, .units = null },
+    .{ .number = 0, .name = "type", .type = types.File },
+    .{ .number = 1, .name = "manufacturer", .type = u16 },
+    .{ .number = 2, .name = "product", .type = u16 },
+    .{ .number = 3, .name = "serial_number", .type = u32 },
+    .{ .number = 4, .name = "time_created", .type = u32 }, // date_time carrier
+    .{ .number = 5, .name = "number", .type = u16 },
+    .{ .number = 8, .name = "product_name", .type = [16]u8 },
 };
 
 const session: []const RawField = &.{
-    .{ .number = 253, .name = "timestamp", .type = u32, .scale = null, .offset = null, .units = "s" }, // date_time carrier
-    .{ .number = 5, .name = "sport", .type = types.Sport, .scale = null, .offset = null, .units = null },
-    .{ .number = 7, .name = "total_elapsed_time", .type = u32, .scale = 1000, .offset = null, .units = "s" },
-    .{ .number = 8, .name = "total_timer_time", .type = u32, .scale = 1000, .offset = null, .units = "s" },
-    .{ .number = 9, .name = "total_distance", .type = u32, .scale = 100, .offset = null, .units = "m" },
+    .{ .number = 253, .name = "timestamp", .type = u32, .units = "s" }, // date_time carrier
+    .{ .number = 5, .name = "sport", .type = types.Sport },
+    .{ .number = 7, .name = "total_elapsed_time", .type = u32, .scale = 1000, .units = "s" },
+    .{ .number = 8, .name = "total_timer_time", .type = u32, .scale = 1000, .units = "s" },
+    .{ .number = 9, .name = "total_distance", .type = u32, .scale = 100, .units = "m" },
 };
 
 const record: []const RawField = &.{
-    .{ .number = 253, .name = "timestamp", .type = u32, .scale = null, .offset = null, .units = "s" }, // date_time carrier
-    .{ .number = 0, .name = "position_lat", .type = i32, .scale = null, .offset = null, .units = "semicircles" }, // semicircles carrier
-    .{ .number = 1, .name = "position_long", .type = i32, .scale = null, .offset = null, .units = "semicircles" },
+    .{ .number = 253, .name = "timestamp", .type = u32, .units = "s" }, // date_time carrier
+    .{ .number = 0, .name = "position_lat", .type = i32, .units = "semicircles" }, // semicircles carrier
+    .{ .number = 1, .name = "position_long", .type = i32, .units = "semicircles" },
     .{ .number = 2, .name = "altitude", .type = u16, .scale = 5, .offset = 500, .units = "m" },
-    .{ .number = 3, .name = "heart_rate", .type = u8, .scale = null, .offset = null, .units = "bpm" },
-    .{ .number = 4, .name = "cadence", .type = u8, .scale = null, .offset = null, .units = null },
-    .{ .number = 5, .name = "distance", .type = u32, .scale = 100, .offset = null, .units = "m" },
-    .{ .number = 6, .name = "speed", .type = u16, .scale = 1000, .offset = null, .units = "m/s" },
+    .{ .number = 3, .name = "heart_rate", .type = u8, .units = "bpm" },
+    .{ .number = 4, .name = "cadence", .type = u8 },
+    .{ .number = 5, .name = "distance", .type = u32, .scale = 100, .units = "m" },
+    .{ .number = 6, .name = "speed", .type = u16, .scale = 1000, .units = "m/s" },
 };
 
 /// The fields of a message, resolved at comptime from its `MesgNum` tag.
@@ -88,6 +88,65 @@ pub fn field(comptime message_number: MesgNum, comptime name: []const u8) RawFie
         if (comptime std.mem.eql(u8, f.name, name)) return f;
     }
     @compileError("no field '" ++ name ++ "' on message " ++ @tagName(message_number));
+}
+
+/// Runtime-facing metadata for a single field, resolved from the comptime
+/// tables for the dynamic `msg.fields()` path. Unlike `RawField` it carries no
+/// `type` (a `type` is not a runtime value); an enum field instead carries
+/// `enumName`, a function mapping a raw wire value to its tag name.
+pub const FieldInfo = struct {
+    number: u8,
+    name: []const u8,
+    units: ?[]const u8,
+    scale: ?f64,
+    offset: ?f64,
+    /// For enum-typed fields: maps a raw wire value to its tag name (null when
+    /// the value is not a named tag). null for non-enum fields.
+    enumName: ?*const fn (u64) ?[]const u8,
+};
+
+/// A comptime-generated namer for an enum value type. `name` maps a raw wire
+/// value to its tag name, or null when the value is out of range / unnamed.
+fn Namer(comptime E: type) type {
+    return struct {
+        fn name(raw: u64) ?[]const u8 {
+            const e = std.enums.fromInt(E, raw) orelse return null;
+            return std.enums.tagName(E, e);
+        }
+    };
+}
+
+/// Lower a comptime `RawField` (which holds a `type`) to runtime `FieldInfo`.
+fn infoOf(comptime f: RawField) FieldInfo {
+    return .{
+        .number = f.number,
+        .name = f.name,
+        .units = f.units,
+        .scale = if (f.scale) |s| @floatFromInt(s) else null,
+        .offset = if (f.offset) |o| @floatFromInt(o) else null,
+        .enumName = if (@typeInfo(f.type) == .@"enum") &Namer(f.type).name else null,
+    };
+}
+
+/// Look up field metadata for a message at runtime, for the dynamic
+/// `msg.fields()` path. Returns null when the message has no profile table or
+/// no field with `number` (an unknown field the caller yields with `name` null).
+///
+/// The set of profiled messages is derived from the tables themselves: a
+/// message has a table iff there is a decl named after its `MesgNum` tag, so
+/// adding a `[]const RawField` is all it takes — no list to keep in sync here.
+pub fn lookup(message_number: MesgNum, number: u8) ?FieldInfo {
+    inline for (@typeInfo(MesgNum).@"enum".fields) |tag| {
+        if (comptime @hasDecl(@This(), tag.name)) {
+            if (message_number == @field(MesgNum, tag.name)) {
+                inline for (comptime fields(@field(MesgNum, tag.name))) |f| {
+                    if (f.number == number) return infoOf(f);
+                }
+                return null;
+            }
+        }
+    }
+    return null;
 }
 
 /// Whether a field's scale/offset conversion requires its decoded target to be

@@ -7,7 +7,7 @@ const Reader = std.Io.Reader;
 const testing = std.testing;
 
 const profile = @import("profile.zig");
-const MesgNum = profile.MesgNum;
+pub const MesgNum = profile.MesgNum;
 pub const Types = @import("types.zig");
 
 /// Information about the FIT File
@@ -112,7 +112,7 @@ fn endian(arch: u8) !Endian {
 }
 
 /// See Table 6 of https://developer.garmin.com/fit/protocol/
-const BaseType = enum(u8) {
+pub const BaseType = enum(u8) {
     enum_ = 0x00,
     sint8 = 0x01,
     uint8 = 0x02,
@@ -226,6 +226,220 @@ fn convert(comptime Child: type, raw: Raw) ?Child {
     };
 }
 
+/// Reinterpret a raw wire scalar as an unsigned integer (for enum tags).
+fn rawToU64(raw: Raw) u64 {
+    return switch (raw) {
+        .u => |u| u,
+        .i => |i| @bitCast(i),
+        .f => unreachable,
+    };
+}
+
+/// Widen a raw wire scalar to `f64` (for scaled/offset and array values).
+fn rawToF64(raw: Raw) f64 {
+    return switch (raw) {
+        .u => |u| @floatFromInt(u),
+        .i => |i| @floatFromInt(i),
+        .f => |f| f,
+    };
+}
+
+/// Apply a field's scale/offset to a value: divide by scale, then subtract
+/// offset (see the FIT Scale/Offset rule). A no-op when both are null.
+fn applyScaleOffset(v: f64, scale: ?f64, offset: ?f64) f64 {
+    var out = v;
+    if (scale) |s| out /= s;
+    if (offset) |o| out -= o;
+    return out;
+}
+
+/// Read one raw scalar per its wire base type. Returns `null` on the invalid
+/// sentinel. A free function so both the `Parser` and the dynamic `Array`
+/// decoder (which reads from a fixed reader over a byte slice) can use it.
+fn readRaw(in: *Reader, base: BaseType, en: Endian) !?Raw {
+    const invalid = base.invalid();
+    switch (base) {
+        .enum_, .uint8, .uint8z, .byte => {
+            const v = try in.takeByte();
+            return if (v == invalid) null else .{ .u = v };
+        },
+        .sint8 => {
+            const v = try in.takeInt(i8, en);
+            return if (@as(u8, @bitCast(v)) == invalid) null else .{ .i = v };
+        },
+        .uint16, .uint16z => {
+            const v = try in.takeInt(u16, en);
+            return if (v == invalid) null else .{ .u = v };
+        },
+        .sint16 => {
+            const v = try in.takeInt(i16, en);
+            return if (@as(u16, @bitCast(v)) == invalid) null else .{ .i = v };
+        },
+        .uint32, .uint32z => {
+            const v = try in.takeInt(u32, en);
+            return if (v == invalid) null else .{ .u = v };
+        },
+        .sint32 => {
+            const v = try in.takeInt(i32, en);
+            return if (@as(u32, @bitCast(v)) == invalid) null else .{ .i = v };
+        },
+        .float32 => {
+            const b = try in.takeInt(u32, en);
+            return if (b == invalid) null else .{ .f = @as(f32, @bitCast(b)) };
+        },
+        .uint64, .uint64z => {
+            const v = try in.takeInt(u64, en);
+            return if (v == invalid) null else .{ .u = v };
+        },
+        .sint64 => {
+            const v = try in.takeInt(i64, en);
+            return if (@as(u64, @bitCast(v)) == invalid) null else .{ .i = v };
+        },
+        .float64 => {
+            const b = try in.takeInt(u64, en);
+            return if (b == invalid) null else .{ .f = @as(f64, @bitCast(b)) };
+        },
+        .string => return FitError.BaseTypeMismatch,
+    }
+}
+
+/// A single decoded field of a message, yielded by `FieldIterator`. `name` and
+/// `units` come from the profile and are null for a field the profile does not
+/// describe (an unknown or developer-defined field number).
+pub const Field = struct {
+    number: u8,
+    name: ?[]const u8,
+    units: ?[]const u8,
+    value: Value,
+};
+
+/// A decoded field value. Mirrors the typed `decode` path: scale/offset are
+/// applied (yielding `float`), enum fields resolve their tag `name`, and
+/// semicircle positions stay raw. `string`/`array` bytes point into the reader
+/// buffer and are valid only until the next `FieldIterator.next()`.
+pub const Value = union(enum) {
+    uint: u64,
+    int: i64,
+    float: f64,
+    enum_tag: EnumTag,
+    string: []const u8,
+    array: Array,
+    /// The field is present but carries the FIT invalid sentinel.
+    invalid,
+};
+
+pub const EnumTag = struct {
+    /// The raw wire value.
+    value: u64,
+    /// Its tag name, or null when the value is not a named tag.
+    name: ?[]const u8,
+};
+
+/// A multi-value field. Elements are decoded on demand from `bytes` (no
+/// allocation); `bytes` is valid only until the next `FieldIterator.next()`.
+pub const Array = struct {
+    bytes: []const u8,
+    base: BaseType,
+    endian: Endian,
+    scale: ?f64,
+    offset: ?f64,
+
+    /// Number of elements.
+    pub fn len(self: Array) usize {
+        return self.bytes.len / self.base.size();
+    }
+
+    /// Decode element `i` to `f64`, applying any scale/offset. Asserts
+    /// `i < len()`. An element carrying the invalid sentinel decodes to NaN.
+    pub fn at(self: Array, i: usize) f64 {
+        const sz = self.base.size();
+        assert(i < self.len());
+        var r: Reader = .fixed(self.bytes[i * sz .. (i + 1) * sz]);
+        const raw = (readRaw(&r, self.base, self.endian) catch unreachable) orelse
+            return std.math.nan(f64);
+        return applyScaleOffset(rawToF64(raw), self.scale, self.offset);
+    }
+};
+
+/// Walk every (non-developer) field of a message in wire order, decoding each
+/// against the profile — the dynamic counterpart to the typed `decode(m, T)`,
+/// à la `fitdump`. Consumes the message just like `decode`: use one or the
+/// other, once. Developer fields are not decoded (their base type lives in a
+/// `field_description` message the parser does not track) but their bytes are
+/// skipped so the stream stays aligned.
+pub const FieldIterator = struct {
+    parser: *Parser,
+    def: *const DefinitionMessage,
+    message_number: MesgNum,
+    endian: Endian,
+    /// Index of the next regular field to yield.
+    index: u8,
+    done: bool,
+
+    pub fn next(self: *FieldIterator) !?Field {
+        if (self.done) return null;
+
+        if (self.index < self.def.num_fields) {
+            const fdef = self.def.fields[self.index];
+            self.index += 1;
+            const info = profile.lookup(self.message_number, fdef.field_definition_number);
+            const value = try self.readValue(fdef, info);
+            self.parser.advancePayload(fdef.size);
+            return .{
+                .number = fdef.field_definition_number,
+                .name = if (info) |i| i.name else null,
+                .units = if (info) |i| i.units else null,
+                .value = value,
+            };
+        }
+
+        // All regular fields yielded: skip developer-field bytes and finalize
+        // so the message is fully consumed for the next `MessageIterator.next()`.
+        self.parser.advancePayload(try self.parser.skipDeveloperFields(self.def));
+        self.parser.pending = null;
+        self.done = true;
+        return null;
+    }
+
+    fn readValue(self: *FieldIterator, fdef: FieldDefinition, info: ?profile.FieldInfo) !Value {
+        const base = fdef.base_type;
+        const in = self.parser.in;
+
+        if (base == .string) {
+            const bytes = try in.take(fdef.size);
+            return .{ .string = std.mem.sliceTo(bytes, 0) };
+        }
+
+        // Anything wider than one element is a multi-value field.
+        if (fdef.size != base.size()) {
+            const bytes = try in.take(fdef.size);
+            return .{ .array = .{
+                .bytes = bytes,
+                .base = base,
+                .endian = self.endian,
+                .scale = if (info) |i| i.scale else null,
+                .offset = if (info) |i| i.offset else null,
+            } };
+        }
+
+        const raw = (try readRaw(in, base, self.endian)) orelse return .invalid;
+        if (info) |i| {
+            if (i.enumName) |namer| {
+                const v = rawToU64(raw);
+                return .{ .enum_tag = .{ .value = v, .name = namer(v) } };
+            }
+            if (i.scale != null or i.offset != null) {
+                return .{ .float = applyScaleOffset(rawToF64(raw), i.scale, i.offset) };
+            }
+        }
+        return switch (raw) {
+            .u => |u| .{ .uint = u },
+            .i => |x| .{ .int = x },
+            .f => |x| .{ .float = x },
+        };
+    }
+};
+
 /// A parsed data message, valid only until the next `MessageIterator.next()`.
 /// Decode it into a view struct with `decode`, or ignore it and its payload is
 /// skipped automatically on the next iteration.
@@ -267,12 +481,24 @@ pub const Message = struct {
 
         // Developer fields are not decoded by the typed path; skip their bytes
         // so the stream stays aligned for the next record.
-        for (def.developer_fields[0..def.num_developer_fields]) |dfd| {
-            try parser.in.discardAll(dfd.size);
-        }
+        _ = try parser.skipDeveloperFields(def);
 
         parser.consumePending();
         return out;
+    }
+
+    /// Walk every field of this message, decoding each against the profile.
+    /// The dynamic counterpart to `decode`; see `FieldIterator`. Like `decode`
+    /// it consumes the message, so call one or the other, once.
+    pub fn fields(msg: Message) !FieldIterator {
+        return .{
+            .parser = msg.parser,
+            .def = msg.def,
+            .message_number = msg.message_number,
+            .endian = try endian(msg.def.arch),
+            .index = 0,
+            .done = false,
+        };
     }
 };
 
@@ -318,6 +544,25 @@ pub const Parser = struct {
         }
     }
 
+    /// Account for `n` payload bytes just read field-by-field by a
+    /// `FieldIterator`, keeping `pending` (bytes still owed) and `data_read` in
+    /// sync so an abandoned field walk still leaves the stream aligned for the
+    /// next `MessageIterator.next()`.
+    fn advancePayload(self: *Parser, n: u32) void {
+        self.data_read += n;
+        self.pending = self.pending.? - n;
+    }
+
+    /// Discard the developer-field bytes of `def` — neither decode path decodes
+    /// them (their base type lives in an untracked `field_description` message).
+    /// Returns the number of bytes skipped so the caller can update accounting.
+    fn skipDeveloperFields(self: *Parser, def: *const DefinitionMessage) !u32 {
+        var n: u32 = 0;
+        for (def.developer_fields[0..def.num_developer_fields]) |dfd| n += dfd.size;
+        try self.in.discardAll(n);
+        return n;
+    }
+
     fn next(self: *Parser) !?Message {
         if (!self.started) {
             self.header = try self.parseHeader();
@@ -328,8 +573,7 @@ pub const Parser = struct {
         // A message yielded but never decoded still owns its payload bytes.
         if (self.pending) |remaining| {
             try self.in.discardAll(remaining);
-            self.data_read += remaining;
-            self.pending = null;
+            self.consumePending();
         }
 
         while (self.data_read < self.header.data_size) {
@@ -475,14 +719,14 @@ pub const Parser = struct {
         switch (@typeInfo(Child)) {
             .int, .float, .@"enum" => {
                 if (base == .string) return FitError.BaseTypeMismatch;
-                if (@divExact(fdef.size, base.size()) != 1) return FitError.ArityMismatch;
+                if (fdef.size != base.size()) return FitError.ArityMismatch;
                 return self.readScalar(Child, base, en);
             },
             .array => |arr| {
                 if (arr.child == u8 and (base == .string or base == .byte)) {
                     return try self.readString(Child, fdef);
                 }
-                if (@divExact(fdef.size, base.size()) != arr.len) return FitError.ArityMismatch;
+                if (fdef.size != base.size() * arr.len) return FitError.ArityMismatch;
                 var out: Child = undefined;
                 for (&out) |*slot| {
                     slot.* = (try self.readScalar(arr.child, base, en)) orelse std.mem.zeroes(arr.child);
@@ -494,56 +738,8 @@ pub const Parser = struct {
     }
 
     fn readScalar(self: *Parser, comptime Child: type, base: BaseType, en: Endian) !?Child {
-        const raw = (try self.readRaw(base, en)) orelse return null;
+        const raw = (try readRaw(self.in, base, en)) orelse return null;
         return convert(Child, raw);
-    }
-
-    /// Read one raw scalar per its wire base type. Returns `null` on the invalid sentinel.
-    fn readRaw(self: *Parser, base: BaseType, en: Endian) !?Raw {
-        const invalid = base.invalid();
-        switch (base) {
-            .enum_, .uint8, .uint8z, .byte => {
-                const v = try self.in.takeByte();
-                return if (v == invalid) null else .{ .u = v };
-            },
-            .sint8 => {
-                const v = try self.in.takeInt(i8, en);
-                return if (@as(u8, @bitCast(v)) == invalid) null else .{ .i = v };
-            },
-            .uint16, .uint16z => {
-                const v = try self.in.takeInt(u16, en);
-                return if (v == invalid) null else .{ .u = v };
-            },
-            .sint16 => {
-                const v = try self.in.takeInt(i16, en);
-                return if (@as(u16, @bitCast(v)) == invalid) null else .{ .i = v };
-            },
-            .uint32, .uint32z => {
-                const v = try self.in.takeInt(u32, en);
-                return if (v == invalid) null else .{ .u = v };
-            },
-            .sint32 => {
-                const v = try self.in.takeInt(i32, en);
-                return if (@as(u32, @bitCast(v)) == invalid) null else .{ .i = v };
-            },
-            .float32 => {
-                const b = try self.in.takeInt(u32, en);
-                return if (b == invalid) null else .{ .f = @as(f32, @bitCast(b)) };
-            },
-            .uint64, .uint64z => {
-                const v = try self.in.takeInt(u64, en);
-                return if (v == invalid) null else .{ .u = v };
-            },
-            .sint64 => {
-                const v = try self.in.takeInt(i64, en);
-                return if (@as(u64, @bitCast(v)) == invalid) null else .{ .i = v };
-            },
-            .float64 => {
-                const b = try self.in.takeInt(u64, en);
-                return if (b == invalid) null else .{ .f = @as(f64, @bitCast(b)) };
-            },
-            .string => return FitError.BaseTypeMismatch,
-        }
     }
 
     /// Read a string/byte field into a fixed `[N]u8`, truncated to `N`. The full
@@ -764,6 +960,102 @@ test "decode figure 14" {
 
     try testing.expectEqual(1, file_ids);
     try testing.expectEqual(3, records);
+}
+
+test "fields() dynamic decode of figure 14" {
+    var r: Reader = .fixed(&fit_file_figure_14);
+    var parser: Parser = .init(&r);
+    var it = parser.messages();
+
+    // Record 2 — file_id: enum tag name, and plain scalars.
+    {
+        const msg = (try it.next()).?;
+        try testing.expectEqual(MesgNum.file_id, msg.message_number);
+        var f = try msg.fields();
+
+        const type_field = (try f.next()).?;
+        try testing.expectEqual(0, type_field.number);
+        try testing.expectEqualStrings("type", type_field.name.?);
+        try testing.expectEqual(4, type_field.value.enum_tag.value);
+        try testing.expectEqualStrings("activity", type_field.value.enum_tag.name.?);
+
+        try testing.expectEqual(15, (try f.next()).?.value.uint); // manufacturer
+        try testing.expectEqual(22, (try f.next()).?.value.uint); // product
+        try testing.expectEqual(1234, (try f.next()).?.value.uint); // serial_number
+        try testing.expectEqual(621463080, (try f.next()).?.value.uint); // time_created
+        try testing.expectEqual(null, try f.next()); // exhausted
+    }
+
+    // Record 4 — developer_data_id: unknown message → name null; a byte array.
+    {
+        const msg = (try it.next()).?;
+        try testing.expectEqual(MesgNum.developer_data_id, msg.message_number);
+        var f = try msg.fields();
+
+        const app_id = (try f.next()).?;
+        try testing.expectEqual(1, app_id.number);
+        try testing.expectEqual(null, app_id.name); // no profile table
+        try testing.expectEqual(16, app_id.value.array.len());
+
+        try testing.expectEqual(0, (try f.next()).?.value.uint); // developer_data_index
+        try testing.expectEqual(null, try f.next());
+    }
+
+    // Record 6 — field_description: unknown message with string fields.
+    {
+        const msg = (try it.next()).?;
+        try testing.expectEqual(MesgNum.field_description, msg.message_number);
+        var f = try msg.fields();
+
+        _ = (try f.next()).?; // developer_data_index
+        _ = (try f.next()).?; // field_definition_number
+        _ = (try f.next()).?; // fit_base_type_id
+        const field_name = (try f.next()).?;
+        try testing.expectEqualStrings("doughnuts_earned", field_name.value.string);
+        const units = (try f.next()).?;
+        try testing.expectEqualStrings("doughnuts", units.value.string);
+        try testing.expectEqual(null, try f.next());
+    }
+
+    // Record 8 — record: scaled floats with units, and a skipped developer field.
+    {
+        const msg = (try it.next()).?;
+        try testing.expectEqual(MesgNum.record, msg.message_number);
+        var f = try msg.fields();
+
+        const hr = (try f.next()).?;
+        try testing.expectEqualStrings("heart_rate", hr.name.?);
+        try testing.expectEqual(140, hr.value.uint);
+        try testing.expectEqualStrings("bpm", hr.units.?);
+
+        try testing.expectEqual(88, (try f.next()).?.value.uint); // cadence
+
+        const distance = (try f.next()).?;
+        try testing.expectEqualStrings("distance", distance.name.?);
+        try testing.expectEqual(5.1, distance.value.float); // 510 / scale 100
+        try testing.expectEqualStrings("m", distance.units.?);
+
+        const speed = (try f.next()).?;
+        try testing.expectEqual(2.8, speed.value.float); // 2800 / scale 1000
+        try testing.expectEqual(null, try f.next()); // developer field skipped
+    }
+}
+
+test "fields() abandoned mid-walk stays aligned" {
+    var r: Reader = .fixed(&fit_file_figure_14);
+    var parser: Parser = .init(&r);
+    var it = parser.messages();
+
+    var count: usize = 0;
+    while (try it.next()) |msg| {
+        // Read just one field, then abandon — the parser must still skip the
+        // rest of the payload on the next `next()`.
+        var f = try msg.fields();
+        _ = try f.next();
+        count += 1;
+    }
+
+    try testing.expectEqual(6, count);
 }
 
 test "readField string and numeric array" {
