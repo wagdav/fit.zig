@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 
-const fit = @import("fit_zig");
+const fit = @import("fit");
 const Sport = fit.Types.Sport;
 
 /// Activity summary — from the single `session` message.
