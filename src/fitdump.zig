@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
         num += 1;
         try printMessageName(out, num, msg.message_number);
 
-        var fields = try msg.fields();
+        var fields = msg.fields();
         while (try fields.next()) |field| {
             try out.print(" * ", .{});
             if (field.name) |name| {

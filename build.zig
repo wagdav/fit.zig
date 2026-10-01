@@ -111,6 +111,26 @@ pub fn build(b: *std.Build) void {
     fitdump_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| fitdump_cmd.addArgs(args);
 
+    // `gen`: reads the FIT JS SDK's profile.js from stdin and writes
+    // the Zig profile tables to stdout.
+    const gen = b.addExecutable(.{
+        .name = "gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gen.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(gen);
+
+    // `zig build gen < profile.js > out.zig` builds and runs it,
+    // piping stdin/stdout straight through.
+    const gen_step = b.step("gen", "Run gen (reads profile.js from stdin, writes Zig to stdout)");
+    const gen_cmd = b.addRunArtifact(gen);
+    gen_cmd.stdio = .inherit;
+    gen_step.dependOn(&gen_cmd.step);
+    if (b.args) |args| gen_cmd.addArgs(args);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

@@ -1,83 +1,30 @@
-//! The FIT Global Profile, as comptime tables.
-//!
-//! Hand-written for now (a subset); the shape is the stable interface and can
-//! later be generated from Garmin's `Profile.xlsx`. Each message is a
-//! `[]const RawField`, and `MesgNum` maps message names to their global numbers.
+//! Lookup helpers over the generated FIT profile tables in `profile.generated.zig`.
 //! See docs/interface-design.md.
 
 const std = @import("std");
-const types = @import("types.zig");
+const generated = @import("profile.generated.zig");
+
+pub const MesgNum = generated.MesgNum;
+pub const types = generated.types;
+pub const version = generated.version;
+pub const version_type = generated.version_type;
 
 /// A single field of a message: its definition number, name, and the decoded
 /// target type. For scalar fields the type is the carrier type (the Zig
 /// integer/float the wire value maps to); for enumerated fields it is the
 /// generated enum.
-const RawField = struct {
+pub const RawField = struct {
     number: u8,
     name: []const u8,
     type: type,
-    scale: ?comptime_int = null,
-    offset: ?comptime_int = null,
+    scale: ?comptime_float = null,
+    offset: ?comptime_float = null,
     units: ?[]const u8 = null,
-};
-
-/// Global message number. Non-exhaustive: any unrecognized number decodes to an
-/// unnamed value, which a `switch (msg.message_number)` handles via `else`.
-pub const MesgNum = enum(u16) {
-    file_id = 0,
-    capabilities = 1,
-    device_settings = 2,
-    user_profile = 3,
-    zones_target = 7,
-    sport = 12,
-    training_settings = 13,
-    session = 18,
-    lap = 19,
-    record = 20,
-    event = 21,
-    device_info = 23,
-    activity = 34,
-    training_file = 72,
-    field_description = 206,
-    developer_data_id = 207,
-    time_in_zone = 216,
-    climb_pro = 317,
-    device_aux_battery_info = 375,
-    _,
-};
-
-const file_id: []const RawField = &.{
-    .{ .number = 0, .name = "type", .type = types.File },
-    .{ .number = 1, .name = "manufacturer", .type = u16 },
-    .{ .number = 2, .name = "product", .type = u16 },
-    .{ .number = 3, .name = "serial_number", .type = u32 },
-    .{ .number = 4, .name = "time_created", .type = u32 }, // date_time carrier
-    .{ .number = 5, .name = "number", .type = u16 },
-    .{ .number = 8, .name = "product_name", .type = [16]u8 },
-};
-
-const session: []const RawField = &.{
-    .{ .number = 253, .name = "timestamp", .type = u32, .units = "s" }, // date_time carrier
-    .{ .number = 5, .name = "sport", .type = types.Sport },
-    .{ .number = 7, .name = "total_elapsed_time", .type = u32, .scale = 1000, .units = "s" },
-    .{ .number = 8, .name = "total_timer_time", .type = u32, .scale = 1000, .units = "s" },
-    .{ .number = 9, .name = "total_distance", .type = u32, .scale = 100, .units = "m" },
-};
-
-const record: []const RawField = &.{
-    .{ .number = 253, .name = "timestamp", .type = u32, .units = "s" }, // date_time carrier
-    .{ .number = 0, .name = "position_lat", .type = i32, .units = "semicircles" }, // semicircles carrier
-    .{ .number = 1, .name = "position_long", .type = i32, .units = "semicircles" },
-    .{ .number = 2, .name = "altitude", .type = u16, .scale = 5, .offset = 500, .units = "m" },
-    .{ .number = 3, .name = "heart_rate", .type = u8, .units = "bpm" },
-    .{ .number = 4, .name = "cadence", .type = u8 },
-    .{ .number = 5, .name = "distance", .type = u32, .scale = 100, .units = "m" },
-    .{ .number = 6, .name = "speed", .type = u16, .scale = 1000, .units = "m/s" },
 };
 
 /// The fields of a message, resolved at comptime from its `MesgNum` tag.
 fn fields(comptime message_number: MesgNum) []const RawField {
-    return @field(@This(), @tagName(message_number));
+    return @field(generated, @tagName(message_number));
 }
 
 /// Look up a single field of a message by name. Raises `@compileError` when the
@@ -122,30 +69,34 @@ fn infoOf(comptime f: RawField) FieldInfo {
         .number = f.number,
         .name = f.name,
         .units = f.units,
-        .scale = if (f.scale) |s| @floatFromInt(s) else null,
-        .offset = if (f.offset) |o| @floatFromInt(o) else null,
+        .scale = if (f.scale) |s| @as(f64, s) else null,
+        .offset = if (f.offset) |o| @as(f64, o) else null,
         .enumName = if (@typeInfo(f.type) == .@"enum") &Namer(f.type).name else null,
     };
 }
 
+/// The runtime field metadata of a message, built once at comptime.
+fn infoTable(comptime message_number: MesgNum) []const FieldInfo {
+    return &struct {
+        const table = blk: {
+            const raw = fields(message_number);
+            var t: [raw.len]FieldInfo = undefined;
+            for (raw, &t) |f, *info| info.* = infoOf(f);
+            break :blk t;
+        };
+    }.table;
+}
+
 /// Look up field metadata for a message at runtime, for the dynamic
-/// `msg.fields()` path. Returns null when the message has no profile table or
-/// no field with `number` (an unknown field the caller yields with `name` null).
-///
-/// The set of profiled messages is derived from the tables themselves: a
-/// message has a table iff there is a decl named after its `MesgNum` tag, so
-/// adding a `[]const RawField` is all it takes — no list to keep in sync here.
+/// `msg.fields()` path. Returns null for a message number the profile does not
+/// name, or a field number the message does not define (an unknown field the
+/// caller yields with `name` null).
 pub fn lookup(message_number: MesgNum, number: u8) ?FieldInfo {
-    inline for (@typeInfo(MesgNum).@"enum".fields) |tag| {
-        if (comptime @hasDecl(@This(), tag.name)) {
-            if (message_number == @field(MesgNum, tag.name)) {
-                inline for (comptime fields(@field(MesgNum, tag.name))) |f| {
-                    if (f.number == number) return infoOf(f);
-                }
-                return null;
-            }
-        }
-    }
+    const table = switch (message_number) {
+        inline else => |m| infoTable(m),
+        _ => return null,
+    };
+    for (table) |info| if (info.number == number) return info;
     return null;
 }
 
