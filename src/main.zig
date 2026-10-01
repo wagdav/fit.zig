@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     var summary: ?Summary = null;
 
     const MesgNum = fit.MesgNum;
-    var discarded: std.EnumSet(MesgNum) = .initEmpty();
+    var discarded: std.EnumSet(MesgNum) = .empty;
 
     var parser: fit.Parser = .init(in);
     var it = parser.messages();
