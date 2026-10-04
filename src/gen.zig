@@ -212,10 +212,11 @@ const RawFieldLines = struct {
     units: ?[]const u8 = null,
 
     fn set(self: *RawFieldLines, line: Line) !void {
-        inline for (@typeInfo(RawFieldLines).@"struct".fields) |f| {
-            if (std.mem.eql(u8, line.key, f.name)) {
-                if (@field(self, f.name) != null) return error.DuplicateFieldKey;
-                @field(self, f.name) = line.value;
+        const info = @typeInfo(RawFieldLines).@"struct";
+        inline for (info.field_names) |field_name| {
+            if (std.mem.eql(u8, line.key, field_name)) {
+                if (@field(self, field_name) != null) return error.DuplicateFieldKey;
+                @field(self, field_name) = line.value;
             }
         }
     }

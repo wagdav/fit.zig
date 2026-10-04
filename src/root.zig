@@ -5,6 +5,7 @@ const assert = std.debug.assert;
 const Endian = std.builtin.Endian;
 const Reader = std.Io.Reader;
 const testing = std.testing;
+const Struct = std.lang.Type.Struct;
 
 const profile = @import("profile.zig");
 pub const MesgNum = profile.MesgNum;
@@ -209,7 +210,7 @@ fn readRaw(in: *Reader, base: BaseType, en: Endian) !?Raw {
 }
 
 fn readRawAs(comptime T: type, in: *Reader, base: BaseType, en: Endian) !?Raw {
-    const bits = try in.takeInt(std.meta.Int(.unsigned, @bitSizeOf(T)), en);
+    const bits = try in.takeInt(@Int(.unsigned, @bitSizeOf(T)), en);
     if (bits == base.invalid()) return null;
     const value: T = @bitCast(bits);
     return switch (@typeInfo(T)) {
@@ -354,8 +355,8 @@ fn StripOptional(comptime T: type) type {
 
 /// A view-struct field is required when it is non-optional and has no default:
 /// it must be filled from the wire, or `decode` fails.
-fn isRequired(comptime f: std.builtin.Type.StructField) bool {
-    return f.defaultValue() == null and @typeInfo(f.type) != .optional;
+fn isRequired(comptime FieldType: type, attrs: Struct.FieldAttributes) bool {
+    return attrs.defaultValue(FieldType) == null and @typeInfo(FieldType) != .optional;
 }
 
 /// Assign the wire field `fdef` (whose payload is `bytes`) to the matching
@@ -368,24 +369,25 @@ fn assignField(
     bytes: []const u8,
     en: Endian,
 ) !void {
-    inline for (@typeInfo(T).@"struct".fields) |view_field| {
-        const field = comptime profile.field(m, view_field.name);
-        const Target = StripOptional(view_field.type);
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |field_name, field_type, field_attr| {
+        const field = comptime profile.field(m, field_name);
+        const Target = StripOptional(field_type);
 
         // Scale/Offset: when specified, the binary quantity is divided by the
         // scale factor and then the offset is subtracted, yielding a floating
         // point quantity.
         if (comptime profile.needsFloatTarget(field) and @typeInfo(Target) != .float)
-            @compileError(@typeName(T) ++ "." ++ view_field.name ++ " should be float because the field uses scale/offset.");
+            @compileError(@typeName(T) ++ "." ++ field_name ++ " should be float because the field uses scale/offset.");
 
         if (fdef.field_definition_number == field.number) {
             var value = (try readField(Target, fdef, bytes, en)) orelse {
-                if (comptime isRequired(view_field)) return FitError.MissingField;
+                if (comptime isRequired(field_type, field_attr)) return FitError.MissingField;
                 return; // optional stays null, defaulted keeps its default
             };
             if (field.scale) |scale| value /= scale;
             if (field.offset) |offset| value -= offset;
-            @field(out, view_field.name) = value;
+            @field(out, field_name) = value;
             return;
         }
     }
@@ -461,12 +463,13 @@ pub const Message = struct {
         msg.assertUnconsumed();
 
         var out: T = undefined;
-        inline for (@typeInfo(T).@"struct".fields) |f| {
-            if (comptime f.defaultValue()) |d| {
-                @field(out, f.name) = d;
-            } else if (@typeInfo(f.type) == .optional) {
-                @field(out, f.name) = null;
-            } else if (!msg.def.hasField(comptime profile.field(m, f.name).number)) {
+        const info = @typeInfo(T).@"struct";
+        inline for (info.field_names, info.field_types, info.field_attrs) |field_name, field_type, field_attr| {
+            if (comptime field_attr.defaultValue(field_type)) |d| {
+                @field(out, field_name) = d;
+            } else if (@typeInfo(field_type) == .optional) {
+                @field(out, field_name) = null;
+            } else if (!msg.def.hasField(comptime profile.field(m, field_name).number)) {
                 return FitError.MissingField;
             }
         }
@@ -664,7 +667,7 @@ test "iterate short file" {
 
 /// Comptime helper: a fixed-size, zero-padded byte array holding a string.
 fn str(comptime n: usize, comptime s: []const u8) [n]u8 {
-    var out = [_]u8{0} ** n;
+    var out: [n]u8 = @splat(0);
     @memcpy(out[0..s.len], s);
     return out;
 }

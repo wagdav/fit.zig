@@ -109,7 +109,7 @@ pub fn build(b: *std.Build) void {
     const fitdump_cmd = b.addRunArtifact(fitdump);
     fitdump_step.dependOn(&fitdump_cmd.step);
     fitdump_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| fitdump_cmd.addArgs(args);
+    fitdump_cmd.addPassthruArgs();
 
     // `gen`: reads the FIT JS SDK's profile.js from stdin and writes
     // the Zig profile tables to stdout.
@@ -129,7 +129,7 @@ pub fn build(b: *std.Build) void {
     const gen_cmd = b.addRunArtifact(gen);
     gen_cmd.stdio = .inherit;
     gen_step.dependOn(&gen_cmd.step);
-    if (b.args) |args| gen_cmd.addArgs(args);
+    gen_cmd.addPassthruArgs();
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
@@ -153,9 +153,7 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
