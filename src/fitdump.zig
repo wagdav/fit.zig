@@ -64,7 +64,7 @@ fn printMessageName(out: *Io.Writer, num: usize, message_number: MesgNum) !void 
     if (std.enums.tagName(MesgNum, message_number)) |name| {
         try out.print("{d}. {s}\n", .{ num, name });
     } else {
-        try out.print("{d}. unknown_{d}\n", .{ num, @intFromEnum(message_number) });
+        try out.print("{d}. unknown_{d}\n", .{ num, @backingInt(message_number) });
     }
 }
 

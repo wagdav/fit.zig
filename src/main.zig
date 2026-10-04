@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.enums.tagName(MesgNum, m)) |name| {
                 try out.print("{s}", .{name});
             } else {
-                try out.print("{d}", .{@intFromEnum(m)});
+                try out.print("{d}", .{@backingInt(m)});
             }
         }
         try out.print("\n", .{});
