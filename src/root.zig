@@ -216,13 +216,11 @@ fn readRawAs(comptime T: type, bytes: []const u8, base: BaseType, en: Endian) ?R
     const bits = std.mem.readInt(@Int(.unsigned, @bitSizeOf(T)), bytes[0..@sizeOf(T)], en);
     if (bits == base.invalid()) return null;
     const value: T = @bitCast(bits);
-    return switch (@typeInfo(T)) {
-        .int => |int| switch (int.signedness) {
-            .unsigned => .{ .u = value },
-            .signed => .{ .i = value },
-        },
-        .float => .{ .f = value },
-        else => comptime unreachable,
+    return switch (T) {
+        u8, u16, u32, u64 => .{ .u = value },
+        i8, i16, i32, i64 => .{ .i = value },
+        f32, f64 => .{ .f = value },
+        else => @compileError("unsupported wire type: " ++ @typeName(T)),
     };
 }
 
