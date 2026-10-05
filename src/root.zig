@@ -20,6 +20,8 @@ pub const FitError = error{
     InvalidBaseType,
     /// A data message refers to a local message type with no prior definition.
     UndefinedLocalMessage,
+    /// A record extends past the data size declared in the file header.
+    DataSizeExceeded,
     CompressedTimestampUnsupported,
     /// A view-struct field's wire arity did not match its target type.
     ArityMismatch,
@@ -326,8 +328,12 @@ pub const FieldIterator = struct {
     index: u8 = 0,
 
     pub fn next(self: *FieldIterator) !?Field {
+        assert(self.index <= self.def.num_fields);
         // Developer fields are not yielded; the parser skips them.
-        if (self.index == self.def.num_fields) return null;
+        if (self.index == self.def.num_fields) {
+            assert(self.parser.unread == self.def.developer_data_size);
+            return null;
+        }
         const fdef = self.def.fields()[self.index];
         self.index += 1;
 
@@ -478,6 +484,8 @@ pub const Message = struct {
             const bytes = try msg.parser.takeField(fdef);
             try assignField(m, T, &out, fdef, bytes, msg.def.endian);
         }
+        // Only the (skipped) developer fields are left of the payload.
+        assert(msg.parser.unread == msg.def.developer_data_size);
         return out;
     }
 
@@ -525,12 +533,41 @@ pub const Parser = struct {
     /// Take the payload bytes of one field of the current message. They are
     /// valid until the next read from `in`.
     fn takeField(self: *Parser, fdef: FieldDefinition) ![]const u8 {
+        // A field never extends past the payload of its message.
+        assert(fdef.size <= self.unread);
         const bytes = try self.in.take(fdef.size);
+        assert(bytes.len == fdef.size);
         self.unread -= fdef.size;
         return bytes;
     }
 
+    fn assertInvariants(self: *const Parser) void {
+        // Unread payload bytes are already counted in `data_read`.
+        assert(self.unread <= self.data_read);
+        if (self.header) |h| {
+            assert(h.size >= 12);
+            assert(std.mem.eql(u8, &h.data_type, ".FIT"));
+            // Records never extend past the data section.
+            assert(self.data_read <= h.data_size);
+        } else {
+            // Nothing is read before the header.
+            assert(self.data_read == 0 and self.unread == 0);
+        }
+    }
+
+    /// Count `n` more bytes of the data section, failing if that would run
+    /// past the size declared in the header.
+    fn account(self: *Parser, n: u32) FitError!void {
+        const data_size = self.header.?.data_size;
+        assert(self.data_read <= data_size);
+        if (n > data_size - self.data_read) return FitError.DataSizeExceeded;
+        self.data_read += n;
+    }
+
     fn next(self: *Parser) !?Message {
+        self.assertInvariants();
+        defer self.assertInvariants();
+
         const header = self.header orelse header: {
             self.header = try self.parseHeader();
             break :header self.header.?;
@@ -542,7 +579,7 @@ pub const Parser = struct {
 
         while (self.data_read < header.data_size) {
             const record: RecordHeader = .decode(try self.in.takeByte());
-            self.data_read += 1;
+            try self.account(1);
             const h = switch (record) {
                 .normal => |h| h,
                 .compressed_timestamp => return FitError.CompressedTimestampUnsupported,
@@ -552,8 +589,9 @@ pub const Parser = struct {
                 continue;
             }
             const def = if (self.definitions[h.local_message_type]) |*def| def else return FitError.UndefinedLocalMessage;
-            self.unread = def.payloadSize();
-            self.data_read += self.unread;
+            const payload_size = def.payloadSize();
+            try self.account(payload_size);
+            self.unread = payload_size;
             return .{ .parser = self, .def = def, .message_number = def.message_number };
         }
         return null;
@@ -561,12 +599,14 @@ pub const Parser = struct {
 
     fn parseHeader(self: *Parser) !FileHeader {
         const size = try self.in.takeByte();
-        if (size < 12) return FitError.InvalidHeader;
+        // 12 bytes (legacy, no CRC) or 14, possibly followed by an extension.
+        if (size < 12 or size == 13) return FitError.InvalidHeader;
         const protocol_version = try self.in.takeByte();
         const profile_version = try self.in.takeInt(u16, .little);
         const data_size = try self.in.takeInt(u32, .little);
-        const data_type = try self.in.takeArray(4);
-        if (!std.mem.eql(u8, data_type, ".FIT")) return FitError.InvalidMagic;
+        // Copied now: the next read may overwrite the reader's buffer.
+        const data_type = (try self.in.takeArray(4)).*;
+        if (!std.mem.eql(u8, &data_type, ".FIT")) return FitError.InvalidMagic;
         const crc = if (size >= 14) try self.in.takeInt(u16, .little) else 0;
         if (size > 14) try self.in.discardAll(size - 14); // unknown extension
 
@@ -575,12 +615,13 @@ pub const Parser = struct {
             .protocol_version = protocol_version,
             .profile_version = profile_version,
             .data_size = data_size,
-            .data_type = data_type.*,
+            .data_type = data_type,
             .crc = crc,
         };
     }
 
     fn parseDefinitionMessage(self: *Parser, header: RecordHeader.Normal) !void {
+        try self.account(5); // reserved, architecture, global message number, field count
         try self.in.discardAll(1); // reserved
         const en = try endian(try self.in.takeByte());
         var def: DefinitionMessage = .{
@@ -590,8 +631,8 @@ pub const Parser = struct {
             .field_buffer = undefined,
             .developer_data_size = 0,
         };
-        self.data_read += 5;
 
+        try self.account(3 * @as(u32, def.num_fields));
         for (def.field_buffer[0..def.num_fields]) |*f| {
             f.* = .{
                 .field_definition_number = try self.in.takeByte(),
@@ -600,16 +641,16 @@ pub const Parser = struct {
                     return FitError.InvalidBaseType,
             };
         }
-        self.data_read += 3 * @as(u32, def.num_fields);
 
         if (header.has_developer_data) {
+            try self.account(1);
             const num_developer_fields = try self.in.takeByte();
+            try self.account(3 * @as(u32, num_developer_fields));
             for (0..num_developer_fields) |_| {
                 try self.in.discardAll(1); // field number
                 def.developer_data_size += try self.in.takeByte();
                 try self.in.discardAll(1); // developer data index
             }
-            self.data_read += 1 + 3 * @as(u32, num_developer_fields);
         }
 
         self.definitions[header.local_message_type] = def;
@@ -652,6 +693,20 @@ test "parse header" {
         .data_type = .{ '.', 'F', 'I', 'T' },
         .crc = 41870,
     }, try parser.parseHeader());
+}
+
+test "parse header through a small buffer" {
+    // Reading the CRC refills the buffer, over the bytes of ".FIT".
+    var buf: [12]u8 = undefined;
+    var r: testing.Reader = .init(&buf, &.{
+        .{ .buffer = fit_file_short[0..12] },
+        .{ .buffer = fit_file_short[12..] },
+    });
+    var parser: Parser = .init(&r.interface);
+
+    const header = try parser.parseHeader();
+    try testing.expectEqualStrings(".FIT", &header.data_type);
+    try testing.expectEqual(41870, header.crc);
 }
 
 test "iterate short file" {
@@ -952,6 +1007,24 @@ test "data message without a definition" {
     try testing.expectError(FitError.UndefinedLocalMessage, parser.messages().next());
 }
 
+test "record past the declared data size" {
+    // Same as the short file, but the header declares 1 byte less of data:
+    // the data message spills past the data section.
+    var bytes = fit_file_short;
+    bytes[4] -= 1;
+    var r: Reader = .fixed(&bytes);
+    var parser: Parser = .init(&r);
+    try testing.expectError(FitError.DataSizeExceeded, parser.messages().next());
+}
+
+test "13-byte header is invalid" {
+    // Too long for a legacy header, too short for the CRC.
+    const bytes = [_]u8{ 0x0D, 0x20, 0x8B, 0x08, 0x24, 0x00, 0x00, 0x00, '.', 'F', 'I', 'T', 0xFF } ++ fit_file_short[14..];
+    var r: Reader = .fixed(bytes);
+    var parser: Parser = .init(&r);
+    try testing.expectError(FitError.InvalidHeader, parser.messages().next());
+}
+
 test "iterate figure 14 without decoding" {
     // Every message auto-skips; the whole file drains cleanly.
     var r: Reader = .fixed(&fit_file_figure_14);
@@ -963,6 +1036,34 @@ test "iterate figure 14 without decoding" {
 
     // file_id, developer_data_id, field_description, 3x record
     try testing.expectEqual(6, count);
+}
+
+// ---------------------------------------------------------------- fuzzing ---
+//
+// Feed the parser arbitrary bytes and walk every message and field: it must
+// never crash, only ever fail with a `FitError`. Seeded with the two real
+// files above, so the fuzzer starts from inputs that reach deep into the parser.
+
+fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    smith.bytes(&buf);
+
+    var r: Reader = .fixed(&buf);
+    var parser: Parser = .init(&r);
+    var it = parser.messages();
+    while (it.next() catch return) |msg| {
+        var f = msg.fields();
+        while (f.next() catch return) |_| {}
+    }
+}
+
+test "fuzz parse" {
+    try testing.fuzz({}, fuzzParse, .{
+        .corpus = &.{
+            &fit_file_short,
+            &fit_file_figure_14,
+        },
+    });
 }
 
 test {

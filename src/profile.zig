@@ -54,11 +54,19 @@ pub const FieldInfo = struct {
 
 /// A comptime-generated namer for an enum value type. `name` maps a raw wire
 /// value to its tag name, or null when the value is out of range / unnamed.
+///
+/// `fromInt`/`tagName` monomorphize a switch per enum type; emitted for every
+/// enum field, they are ~1/5 of the binary's instrumented edges. Mapping an
+/// integer to a tag name is deterministic and cannot fault on arbitrary input,
+/// so there is nothing for a fuzzer to find here: inline them into one
+/// `@disableInstrumentation` function to keep them out of the coverage map and
+/// let fuzzing focus on the parser.
 fn Namer(comptime E: type) type {
     return struct {
         fn name(raw: u64) ?[]const u8 {
-            const e = std.enums.fromInt(E, raw) orelse return null;
-            return std.enums.tagName(E, e);
+            @disableInstrumentation();
+            const e = @call(.always_inline, std.enums.fromInt, .{ E, raw }) orelse return null;
+            return @call(.always_inline, std.enums.tagName, .{ E, e });
         }
     };
 }
