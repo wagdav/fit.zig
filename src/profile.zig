@@ -63,25 +63,21 @@ fn Namer(comptime E: type) type {
     };
 }
 
-/// Lower a comptime `RawField` (which holds a `type`) to runtime `FieldInfo`.
-fn infoOf(comptime f: RawField) FieldInfo {
-    return .{
-        .number = f.number,
-        .name = f.name,
-        .units = f.units,
-        .scale = if (f.scale) |s| @as(f64, s) else null,
-        .offset = if (f.offset) |o| @as(f64, o) else null,
-        .enumName = if (@typeInfo(f.type) == .@"enum") &Namer(f.type).name else null,
-    };
-}
-
-/// The runtime field metadata of a message, built once at comptime.
+/// The runtime field metadata of a message, built once at comptime by lowering
+/// each comptime `RawField` (which holds a `type`) to a runtime `FieldInfo`.
 fn infoTable(comptime message_number: MesgNum) []const FieldInfo {
     return &struct {
         const table = blk: {
             const raw = fields(message_number);
             var t: [raw.len]FieldInfo = undefined;
-            for (raw, &t) |f, *info| info.* = infoOf(f);
+            for (raw, &t) |f, *info| info.* = .{
+                .number = f.number,
+                .name = f.name,
+                .units = f.units,
+                .scale = if (f.scale) |s| @as(f64, s) else null,
+                .offset = if (f.offset) |o| @as(f64, o) else null,
+                .enumName = if (@typeInfo(f.type) == .@"enum") &Namer(f.type).name else null,
+            };
             break :blk t;
         };
     }.table;
