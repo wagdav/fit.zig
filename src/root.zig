@@ -192,25 +192,28 @@ const Raw = union(enum) {
     }
 };
 
-/// Read one scalar per its wire base type. Returns `null` on the invalid sentinel.
-fn readRaw(in: *Reader, base: BaseType, en: Endian) !?Raw {
+/// Decode one scalar from exactly `base.size()` wire bytes. Returns `null` on
+/// the invalid sentinel. Asserts `base` is not `.string`: strings are not
+/// scalars, and callers handle them before getting here.
+fn readRaw(bytes: []const u8, base: BaseType, en: Endian) ?Raw {
+    assert(bytes.len == base.size());
     return switch (base) {
-        .enum_, .uint8, .uint8z, .byte => readRawAs(u8, in, base, en),
-        .uint16, .uint16z => readRawAs(u16, in, base, en),
-        .uint32, .uint32z => readRawAs(u32, in, base, en),
-        .uint64, .uint64z => readRawAs(u64, in, base, en),
-        .sint8 => readRawAs(i8, in, base, en),
-        .sint16 => readRawAs(i16, in, base, en),
-        .sint32 => readRawAs(i32, in, base, en),
-        .sint64 => readRawAs(i64, in, base, en),
-        .float32 => readRawAs(f32, in, base, en),
-        .float64 => readRawAs(f64, in, base, en),
-        .string => FitError.BaseTypeMismatch,
+        .enum_, .uint8, .uint8z, .byte => readRawAs(u8, bytes, base, en),
+        .uint16, .uint16z => readRawAs(u16, bytes, base, en),
+        .uint32, .uint32z => readRawAs(u32, bytes, base, en),
+        .uint64, .uint64z => readRawAs(u64, bytes, base, en),
+        .sint8 => readRawAs(i8, bytes, base, en),
+        .sint16 => readRawAs(i16, bytes, base, en),
+        .sint32 => readRawAs(i32, bytes, base, en),
+        .sint64 => readRawAs(i64, bytes, base, en),
+        .float32 => readRawAs(f32, bytes, base, en),
+        .float64 => readRawAs(f64, bytes, base, en),
+        .string => unreachable,
     };
 }
 
-fn readRawAs(comptime T: type, in: *Reader, base: BaseType, en: Endian) !?Raw {
-    const bits = try in.takeInt(@Int(.unsigned, @bitSizeOf(T)), en);
+fn readRawAs(comptime T: type, bytes: []const u8, base: BaseType, en: Endian) ?Raw {
+    const bits = std.mem.readInt(@Int(.unsigned, @bitSizeOf(T)), bytes[0..@sizeOf(T)], en);
     if (bits == base.invalid()) return null;
     const value: T = @bitCast(bits);
     return switch (@typeInfo(T)) {
@@ -271,8 +274,7 @@ pub const Value = union(enum) {
             .offset = offset,
         } };
 
-        var r: Reader = .fixed(bytes);
-        const raw = (readRaw(&r, base, en) catch unreachable) orelse return .invalid;
+        const raw = readRaw(bytes, base, en) orelse return .invalid;
         if (info) |i| if (i.enumName) |name| switch (raw) {
             .u => |u| return .{ .enum_tag = .{ .value = u, .name = name(u) } },
             .i, .f => {}, // not a valid tag: report the plain value
@@ -312,8 +314,7 @@ pub const Array = struct {
     pub fn at(self: Array, i: usize) f64 {
         assert(i < self.len());
         const sz = self.base.size();
-        var r: Reader = .fixed(self.bytes[i * sz ..][0..sz]);
-        const raw = (readRaw(&r, self.base, self.endian) catch unreachable) orelse
+        const raw = readRaw(self.bytes[i * sz ..][0..sz], self.base, self.endian) orelse
             return std.math.nan(f64);
         return applyScaleOffset(raw.toF64(), self.scale, self.offset);
     }
@@ -398,11 +399,10 @@ fn assignField(
 fn readField(comptime T: type, fdef: FieldDefinition, bytes: []const u8, en: Endian) !?T {
     assert(bytes.len == fdef.size);
     const base = fdef.base_type;
-    var r: Reader = .fixed(bytes);
     switch (@typeInfo(T)) {
         .int, .float, .@"enum" => {
             if (fdef.size != base.size()) return FitError.ArityMismatch;
-            return readScalar(T, &r, base, en);
+            return readScalar(T, bytes, base, en);
         },
         .array => |arr| {
             if (arr.child == u8 and (base == .string or base == .byte)) {
@@ -414,9 +414,10 @@ fn readField(comptime T: type, fdef: FieldDefinition, bytes: []const u8, en: End
                 return out;
             }
             if (fdef.size != base.size() * arr.len) return FitError.ArityMismatch;
+            const sz = base.size();
             var out: T = undefined;
-            for (&out) |*slot| {
-                slot.* = (try readScalar(arr.child, &r, base, en)) orelse std.mem.zeroes(arr.child);
+            for (&out, 0..) |*slot, i| {
+                slot.* = (try readScalar(arr.child, bytes[i * sz ..][0..sz], base, en)) orelse std.mem.zeroes(arr.child);
             }
             return out;
         },
@@ -426,8 +427,9 @@ fn readField(comptime T: type, fdef: FieldDefinition, bytes: []const u8, en: End
 
 /// Read one scalar and convert it to `T`. Returns `null` for the invalid
 /// sentinel and for an enum value that is not a named tag.
-fn readScalar(comptime T: type, r: *Reader, base: BaseType, en: Endian) !?T {
-    const raw = (try readRaw(r, base, en)) orelse return null;
+fn readScalar(comptime T: type, bytes: []const u8, base: BaseType, en: Endian) !?T {
+    if (base == .string) return FitError.BaseTypeMismatch;
+    const raw = readRaw(bytes, base, en) orelse return null;
     return switch (@typeInfo(T)) {
         .int => switch (raw) {
             .u => |u| std.math.cast(T, u) orelse FitError.ValueOutOfRange,
