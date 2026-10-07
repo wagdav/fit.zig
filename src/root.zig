@@ -4,6 +4,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Endian = std.builtin.Endian;
 const Reader = std.Io.Reader;
+const Writer = std.Io.Writer;
 const testing = std.testing;
 const Struct = std.lang.Type.Struct;
 
@@ -1023,18 +1024,86 @@ test "iterate figure 14 without decoding" {
     try testing.expectEqual(6, count);
 }
 
-// ---------------------------------------------------------------- fuzzing ---
+/// Largest data-message payload this generator emits: 8 fields and 4 developer
+/// fields, each at most 16 bytes.
+const max_fuzz_payload = (8 + 4) * 16;
 
+/// Feed the parser a structurally coherent FIT file and walk every message and
+/// field.
 fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {
-    var buf: [4096]u8 = undefined;
-    smith.bytes(&buf);
+    // The record stream (everything after the file header). Built first so the
+    // header can declare its exact `data_size`.
+    var body_buf: [4096]u8 = undefined;
+    var body: Writer = .fixed(&body_buf);
 
-    var r: Reader = .fixed(&buf);
+    // Payload size of each defined local message type, or null while undefined.
+    var defined: [max_definitions]?u32 = @splat(null);
+
+    while (!smith.eos()) {
+        const local = smith.value(u4);
+        if (smith.value(bool)) {
+            // Definition message
+            const en = smith.valueRangeAtMost(u8, 0, 1); // 0: little endian, 1: big endian
+            const num_fields = smith.valueRangeAtMost(u8, 0, 8);
+            const has_dev = smith.value(bool);
+            const dev_bit: u8 = if (has_dev) 0x20 else 0;
+
+            try body.writeByte(0x40 | dev_bit | @as(u8, local)); // definition header
+            try body.writeByte(0); // reserved
+            try body.writeByte(en); // architecture
+            try body.writeInt(u16, smith.value(u16), if (en == 0) .little else .big); // global message number
+            try body.writeByte(num_fields);
+
+            var payload: u32 = 0;
+            for (0..num_fields) |_| {
+                const size = smith.valueRangeAtMost(u8, 0, 16);
+                try body.writeByte(smith.value(u8)); // field definition number
+                try body.writeByte(size);
+                try body.writeByte(@intFromEnum(smith.value(BaseType)));
+                payload += size;
+            }
+
+            if (has_dev) {
+                const num_dev = smith.valueRangeAtMost(u8, 0, 4);
+                try body.writeByte(num_dev);
+                for (0..num_dev) |_| {
+                    const size = smith.valueRangeAtMost(u8, 0, 16);
+                    try body.writeByte(smith.value(u8)); // field number
+                    try body.writeByte(size);
+                    try body.writeByte(smith.value(u8)); // developer data index
+                    payload += size;
+                }
+            }
+
+            defined[local] = payload;
+        } else if (defined[local]) |payload| {
+            // Data message: header, then a payload matching its definition
+            try body.writeByte(@as(u8, local));
+            var raw: [max_fuzz_payload]u8 = undefined;
+            smith.bytes(raw[0..payload]);
+            try body.writeAll(raw[0..payload]);
+        }
+    }
+    const data = body.buffered();
+
+    // Wrap the body in a valid 14-byte header declaring its exact size.
+    var file_buf: [14 + body_buf.len]u8 = undefined;
+    var file: Writer = .fixed(&file_buf);
+    try file.writeByte(14); // header size
+    try file.writeByte(0x20); // protocol version
+    try file.writeInt(u16, 0, .little); // profile version
+    try file.writeInt(u32, @intCast(data.len), .little); // data size
+    try file.writeAll(".FIT");
+    try file.writeInt(u16, 0, .little); // CRC (ignored by the parser)
+    try file.writeAll(data);
+
+    var r: Reader = .fixed(file.buffered());
     var parser: Parser = .init(&r);
+
     var it = parser.messages();
-    while (it.next() catch return) |msg| {
+    while (try it.next()) |msg| {
         var f = msg.fields();
-        while (f.next() catch return) |_| {}
+        while (try f.next()) |_| {}
     }
 }
 
